@@ -1,0 +1,40 @@
+name: Split Ember sources into chunks
+on:
+  push:
+    paths:
+      - '.github/workflows/split-ember.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  split:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+      - name: Checkout Ember upstream
+        uses: actions/checkout@v4
+        with:
+          repository: ember-protocol/Ember-Vaults-EVM
+          ref: main
+          path: ember
+      - name: Split and commit
+        run: |
+          rm -rf chunks && mkdir -p chunks
+          cd ember
+          for f in contracts/EmberVault.sol contracts/EmberETHVault.sol contracts/AtomicLiquidity.sol contracts/libraries/AtomicLiquidityLib.sol docs/AtomicLiquidity.md contracts/EmberETHVault.README.md README.md; do
+            safe=$(echo "$f" | tr '/' '_')
+            mkdir -p "chunks/$safe"
+            split -b 24000 -d --additional-suffix=.txt "$f" "chunks/$safe/p"
+            git hash-object "$f" > "chunks/$safe/GITBLOB.txt"
+            wc -c < "$f" > "chunks/$safe/SIZE.txt"
+          done
+          cd ..
+          rm -rf ember
+      - name: Commit chunks
+        run: |
+          git config user.name github-actions
+          git config user.email github-actions@users.noreply.github.com
+          git add chunks
+          git commit -m "ember source chunks" || echo nothing
+          git push
