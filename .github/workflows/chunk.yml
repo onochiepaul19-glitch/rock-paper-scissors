@@ -15,31 +15,30 @@ jobs:
           repository: revert-finance/v4lend
           ref: f6d0fb41b7487f60ce64e011312a956e184e2a75
           path: v4lend-src
-      - name: Split and stage chunks
+      - name: Hex-split and stage
         run: |
           set -e
-          rm -rf chunks
-          mkdir -p chunks
+          rm -rf hex
+          mkdir -p hex
           cd v4lend-src
           find src docs -type f | sort > ../allfiles.txt
           while IFS= read -r f; do
             flat=$(echo "$f" | tr '/' '_')
-            size=$(stat -c%s "$f")
-            if [ "$size" -gt 30000 ]; then
-              split -b 30000 -d -a 2 "$f" "../chunks/${flat}.part-"
-            else
-              cp "$f" "../chunks/${flat}"
-            fi
+            rm -rf /tmp/parts && mkdir -p /tmp/parts
+            split -b 15000 -d -a 2 "$f" "/tmp/parts/p"
+            i=0
+            for p in /tmp/parts/p*; do
+              od -An -v -tx1 "$p" | tr -d ' \n' > "../hex/${flat}.$(printf %02d $i).hex"
+              i=$((i+1))
+            done
+            md5sum "$f" >> ../hex/orig-md5.txt
           done < ../allfiles.txt
-          cd ../chunks
-          md5sum * > ../chunks-md5.txt
-          cp ../chunks-md5.txt .
-          cat ../chunks-md5.txt
+          sort ../hex/orig-md5.txt -o ../hex/orig-md5.txt
       - name: Commit and push
         run: |
           set -e
           git config user.name "audit-bot"
           git config user.email "actions@github.com"
-          git add chunks
-          git commit -m "add audit chunks [skip ci]"
+          git add hex
+          git commit -m "add hex chunks [skip ci]"
           git push
