@@ -1,0 +1,45 @@
+name: audit-chunks
+on:
+  push:
+    branches: [audit-chunks]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch pinned upstream tree
+        uses: actions/checkout@v4
+        with:
+          repository: revert-finance/v4lend
+          ref: f6d0fb41b7487f60ce64e011312a956e184e2a75
+          path: v4lend-src
+      - name: Split and stage chunks
+        run: |
+          set -e
+          rm -rf chunks
+          mkdir -p chunks
+          cd v4lend-src
+          find src docs -type f | sort > ../allfiles.txt
+          while IFS= read -r f; do
+            flat=$(echo "$f" | tr '/' '_')
+            size=$(stat -c%s "$f")
+            if [ "$size" -gt 30000 ]; then
+              split -b 30000 -d -a 2 "$f" "../chunks/${flat}.part-"
+            else
+              cp "$f" "../chunks/${flat}"
+            fi
+          done < ../allfiles.txt
+          cd ../chunks
+          md5sum * > ../chunks-md5.txt
+          cp ../chunks-md5.txt .
+          cat ../chunks-md5.txt
+      - name: Commit and push
+        run: |
+          set -e
+          git config user.name "audit-bot"
+          git config user.email "actions@github.com"
+          git add chunks
+          git commit -m "add audit chunks [skip ci]"
+          git push
