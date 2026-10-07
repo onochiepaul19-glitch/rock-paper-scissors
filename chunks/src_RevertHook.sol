@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity ^0.8.30;
+import {IV4Oracle} from "./oracle/interfaces/IV4Oracle.sol";
+import {IHookFeeController} from "./hook/interfaces/IHookFeeController.sol";
+import {IHookAuctionController} from "./hook/interfaces/IHookAuctionController.sol";
+import {RevertHookAutoLendActions} from "./hook/RevertHookAutoLendActions.sol";
+import {RevertHookAutoLeverageActions} from "./hook/RevertHookAutoLeverageActions.sol";
+import {RevertHookMigrationActions} from "./hook/RevertHookMigrationActions.sol";
+import {RevertHookBase} from "./hook/RevertHookBase.sol";
+import {RevertHookCallbacks} from "./hook/RevertHookCallbacks.sol";
+import {RevertHookPositionActions} from "./hook/RevertHookPositionActions.sol";
+
+/// @title RevertHook
+/// @notice Uniswap V4 hook enabling automated LP position management features
+/// @dev The concrete hook is intentionally thin. Source-level responsibilities live in:
+///      - RevertHookViews: read API
+///      - RevertHookConfig: configuration setters and validation
+///      - RevertHookImmediate: immediate trigger execution helpers
+///      - RevertHookExecution: action dispatch and delegatecall entrypoints
+///      - RevertHookCallbacks: hook callback flow and fee accounting
+contract RevertHook is RevertHookCallbacks {
+    constructor(
+        address owner_,
+        IV4Oracle _v4Oracle,
+        IHookFeeController _hookFeeController,
+        IHookAuctionController _hookAuctionController,
+        RevertHookPositionActions _positionActions,
+        RevertHookAutoLeverageActions _autoLeverageActions,
+        RevertHookAutoLendActions _autoLendActions,
+        RevertHookMigrationActions _migrationActions
+    )
+        RevertHookBase(
+            owner_,
+            _v4Oracle,
+            _hookFeeController,
+            _hookAuctionController,
+            _positionActions,
+            _autoLeverageActions,
+            _autoLendActions,
+            _migrationActions
+        )
+    {}
+}

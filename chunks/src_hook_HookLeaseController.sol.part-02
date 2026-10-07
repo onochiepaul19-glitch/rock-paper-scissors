@@ -1,0 +1,37 @@
+       poolManager.sync(currency);
+        IERC20 token = IERC20(Currency.unwrap(currency));
+        uint256 balanceBefore = token.balanceOf(address(this));
+        token.safeTransfer(address(poolManager), amount);
+        if (poolManager.settle() != amount) {
+            revert ExactTransferFailed();
+        }
+        if (balanceBefore - token.balanceOf(address(this)) != amount) {
+            revert ExactTransferFailed();
+        }
+    }
+
+    // ==================== Internal: token movement ====================
+
+    /// @dev Pulls `amount` from msg.sender, reverting unless this contract's balance increases by
+    ///      exactly `amount` (fee-on-transfer deposits would corrupt the escrow accounting).
+    function _pullExact(Currency currency, uint256 amount) internal {
+        IERC20 token = IERC20(Currency.unwrap(currency));
+        uint256 balanceBefore = token.balanceOf(address(this));
+        token.safeTransferFrom(msg.sender, address(this), amount);
+        if (token.balanceOf(address(this)) - balanceBefore != amount) {
+            revert ExactTransferFailed();
+        }
+    }
+
+    /// @dev Transfers `amount` out, reverting unless this contract's balance decreases by exactly
+    ///      `amount` - a sender-side surcharge would silently consume funds backing the other
+    ///      escrowed obligations (deposits, refunds, protocol fees, pending donations).
+    function _transferOutExact(Currency currency, address recipient, uint256 amount) internal {
+        IERC20 token = IERC20(Currency.unwrap(currency));
+        uint256 balanceBefore = token.balanceOf(address(this));
+        token.safeTransfer(recipient, amount);
+        if (balanceBefore - token.balanceOf(address(this)) != amount) {
+            revert ExactTransferFailed();
+        }
+    }
+}

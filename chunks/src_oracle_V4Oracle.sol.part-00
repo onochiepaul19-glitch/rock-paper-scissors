@@ -1,0 +1,568 @@
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity ^0.8.0;
+
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+
+import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
+import {PositionInfoLibrary, PositionInfo} from "@uniswap/v4-periphery/src/libraries/PositionInfoLibrary.sol";
+import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
+import {FixedPoint128} from "@uniswap/v4-core/src/libraries/FixedPoint128.sol";
+import {LiquidityAmounts} from "@uniswap/v4-core/test/utils/LiquidityAmounts.sol";
+
+import {Constants} from "../shared/Constants.sol";
+import {IRemintMigrationHook} from "../vault/interfaces/IRemintMigrationHook.sol";
+import {IPositionFeeQuoter} from "./interfaces/IPositionFeeQuoter.sol";
+import {IV4Oracle} from "./interfaces/IV4Oracle.sol";
+
+// Chainlink Price Feed Interface
+interface AggregatorV3Interface {
+    function decimals() external view returns (uint8);
+    function latestRoundData()
+        external
+        view
+        returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+}
+
+interface IUniswapV3Pool {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function slot0()
+        external
+        view
+        returns (
+            uint160 sqrtPriceX96,
+            int24 tick,
+            uint16 observationIndex,
+            uint16 observationCardinality,
+            uint16 observationCardinalityNext,
+            uint8 feeProtocol,
+            bool unlocked
+        );
+    function observe(uint32[] calldata secondsAgos)
+        external
+        view
+        returns (int56[] memory tickCumulatives, uint160[] memory secondsPerLiquidityCumulativeX128s);
+}
+
+/// @title V4Oracle for Uniswap V4 position valuation using two independent price sources
+/// @notice Oracle that combines Chainlink-compatible feeds and Uniswap v3 TWAPs for lending/borrowing values
+/// @dev Validates configured source prices against each other and validates v4 pool spot prices against the derived oracle price
+/// @custom:security Price Manipulation Protection:
+///   - Two-source modes enforce Chainlink-compatible and Uniswap v3 TWAP prices must agree within maxDifference
+///   - maxPoolPriceDifference enforces v4 pool spot price must be within X% of the derived oracle price
+///   - Position values use oracle-derived prices, not raw pool prices
+///   - Sequencer uptime feed check for L2 networks prevents stale data during outages
+/// @custom:security Feed Staleness:
+///   - Each token has configurable maxFeedAge to reject stale Chainlink-compatible data
+///   - Sequencer grace period (10 min) ensures L2 data is fresh after restart
+/// @custom:security Trust Assumptions:
+///   - Owner is trusted to configure valid feeds, TWAP pools, staleness parameters, and emergency modes
+contract V4Oracle is IV4Oracle, Ownable2Step, Constants {
+    uint256 private constant SEQUENCER_GRACE_PERIOD_TIME = 600; // 10mins
+    // Uniswap v4 settles every principal and fee amount of a modifyLiquidity call, and every take, through
+    // SafeCast.toInt128, which rejects amounts >= 2^127. A position cannot pay out more of a currency than
+    // exists, so a token whose total supply is below this bound can never put a removal past it; the
+    // constructor and `setTokenConfig` refuse any other token (`_requireBoundedSupply`, V4LE-61 / V4LE-98 /
+    // V4LE-156). Fees and a hook obligation at or beyond it are reported rather than counted (V4LE-6,
+    // V4LE-113): v4 could never pay them out.
+    uint256 private constant V4_SETTLEMENT_BOUND = 1 << 127;
+
+    event TokenConfigUpdated(address indexed token, TokenConfig config);
+    event OracleModeUpdated(address indexed token, Mode mode);
+    event SetMaxPoolPriceDifference(uint16 maxPoolPriceDifference);
+    event SetEmergencyAdmin(address emergencyAdmin);
+    event SetSequencerUptimeFeed(address sequencerUptimeFeed);
+
+    error InvalidPool();
+    error SqrtPriceOutOfRange();
+    error SettlementBoundExceeded();
+    error FeedDecimalsChanged();
+    error TokenDecimalsChanged();
+
+    enum Mode {
+        NOT_SET,
+        CHAINLINK_TWAP_VERIFY,
+        TWAP_CHAINLINK_VERIFY,
+        CHAINLINK,
+        TWAP
+    }
+
+    IPoolManager public immutable poolManager;
+    IPositionManager public immutable positionManager;
+
+    // Common token used as reference for price calculations (typically WETH/USDC)
+    address public immutable referenceToken;
+    uint8 public immutable referenceTokenDecimals;
+
+    // Common token used in Chainlink feeds as "pair" (address(0xdead) if USD or other non-token reference)
+    address public immutable chainlinkReferenceToken;
+
+    struct TokenConfig {
+        AggregatorV3Interface feed; // Chainlink-compatible feed
+        uint32 maxFeedAge; // Max age of feed data in seconds
+        uint8 feedDecimals; // Decimals of the feed
+        uint8 tokenDecimals; // Decimals of the token
+        uint32 twapSeconds; // Uniswap v3 TWAP period
+        IUniswapV3Pool twapPool; // Uniswap v3 reference pool against referenceToken
+        address twapTokenAlias; // Token used in the TWAP pool, e.g. WETH for native ETH; carries tokenDecimals
+        bool twapTokenIsToken0; // True when twapTokenAlias is token0 in twapPool
+        Mode mode; // Source selection and verification mode
+        uint16 maxDifference; // Max difference between Chainlink-compatible and TWAP sources x10000
+    }
+
+    error SourceNotRecovered(address token);
+    mapping(address token => uint32 secondsAfterRestart) public recoveryPeriods;
+    event SetRecoveryPeriod(address indexed token, uint32 period);
+
+    /// @notice Additional per-token recovery delay; the common grace and full TWAP window also apply.
+    function setRecoveryPeriod(address token, uint32 period) external onlyOwner {
+        recoveryPeriods[token] = period;
+        emit SetRecoveryPeriod(token, period);
+    }
+
+    /// @notice Compare debt shares per unit of collateral at one unchanged vault exchange rate.
+    function getRiskScore(uint256 tokenId, address quoteToken, uint256 debtShares) public view returns (uint256) {
+        if (debtShares == 0) return 0;
+        (uint256 value,,,) = getValue(tokenId, quoteToken);
+        return value == 0 ? type(uint256).max : Math.mulDiv(debtShares, Q96, value, Math.Rounding.Ceil);
+    }
+
+    function validateRiskChange(uint256 tokenId, address quoteToken, uint256 debtShares, uint256 previousRisk) external view {
+        if (debtShares != 0) _validateVaultPosition(tokenId, quoteToken);
+        if (getRiskScore(tokenId, quoteToken, debtShares) > previousRisk) validateBorrow(tokenId, quoteToken);
+    }
+
+    function validateBorrow(uint256 tokenId, address quoteToken) public view {
+        _validateVaultPosition(tokenId, quoteToken);
+        uint256 restart = _requireSequencerUp();
+        if (restart == 0) return;
+        (PoolKey memory key,) = positionManager.getPoolAndPositionInfo(tokenId);
+        _requireRecoveredToken(Currency.unwrap(key.currency0), restart);
+        _requireRecoveredToken(Currency.unwrap(key.currency1), restart);
+        _requireRecoveredToken(quoteToken, restart);
+    }
+
+    /// @dev Token amounts the whole position pays out at the LIVE pool price, where v4 settles a decrease
+    ///      (the oracle-derived composition is what is valued, not what is paid). Requires `_getAmounts` to
+    ///      have filled the range sqrt prices.
+    function _liveAmounts(PositionState memory state) internal pure returns (uint256 live0, uint256 live1) {
+        if (state.liquidity == 0) return (0, 0);
+        return LiquidityAmounts.getAmountsForLiquidity(
+            state.sqrtPriceX96, state.sqrtPriceX96Lower, state.sqrtPriceX96Upper, state.liquidity
+        );
+    }
+
+    function _validateVaultPosition(uint256 tokenId, address asset) internal view {
+        (PoolKey memory key,) = positionManager.getPoolAndPositionInfo(tokenId);
+        if (address(key.hooks) != address(0)) IRemintMigrationHook(address(key.hooks)).validateVaultPosition(tokenId, asset);
+    }
+
+    /// @dev A token is accepted only while its total supply is below v4's int128 settlement bound: a
+    ///      position's principal and fees in a currency are bounded by what exists of it, so no decrease and
+    ///      no take of such a token can ever exceed what v4 settles in one call, at any pool price and any
+    ///      liquidity. This is the whole settlement guard; the valuation never bounds principal (a snapshot
+    ///      bound there was a liquidation lockout once the price drifted past it, V4LE-61 / V4LE-98 /
+    ///      V4LE-156). Native ETH is far below the bound. A token minting past it after configuration is a
+    ///      token failure outside the trust model, like any other supply attack on its price.
+    function _requireBoundedSupply(address token) internal view {
+        if (token != address(0) && IERC20Metadata(token).totalSupply() >= V4_SETTLEMENT_BOUND) {
+            revert SettlementBoundExceeded();
+        }
+    }
+
+    function _requireRecoveredToken(address token, uint256 restart) internal view {
+        if (token == referenceToken) return; // identity price; its feed is checked when used as denominator
+        TokenConfig memory config = feedConfigs[token];
+        if (config.mode == Mode.NOT_SET) revert NotConfigured();
+        uint256 elapsed = block.timestamp - restart;
+        if (elapsed < recoveryPeriods[token]) revert SourceNotRecovered(token);
+        if (_usesChainlink(config.mode)) {
+            _requireRecoveredFeed(token, restart);
+            _requireRecoveredFeed(referenceToken, restart);
+        }
+        if (config.mode != Mode.CHAINLINK && elapsed < config.twapSeconds) revert SourceNotRecovered(token);
+    }
+
+    function _requireRecoveredFeed(address token, uint256 restart) internal view {
+        if (token == chainlinkReferenceToken) return;
+        (, , , uint256 updatedAt,) = feedConfigs[token].feed.latestRoundData();
+        if (updatedAt < restart || block.timestamp - restart < recoveryPeriods[token]) {
+            revert SourceNotRecovered(token);
+        }
+    }
+
+    error HookFeeQuoterNotConfigured(address hook);
+    error InvalidFeeQuoter();
+    /// @notice The hook's obligation in one currency exceeds what the whole position pays out in that currency
+    ///         at the live pool price, so no removal can settle it in the fee-first unlock.
+    error HookChargeUnfundable();
+    /// @notice Nonzero hooks must have an explicit trusted fee quoter. This oracle's address is
+    /// the explicit no-fee sentinel, only for hooks reviewed as not charging position fees.
+    mapping(address hook => address quoter) public hookFeeQuoters;
+    event SetHookFeeQuoter(address indexed hook, address quoter);
+
+    function setHookFeeQuoter(address hook, address quoter) external onlyOwner {
+        if (quoter != address(0) && quoter != address(this) && IPositionFeeQuoter(quoter).hook() != hook) {
+            revert InvalidFeeQuoter();
+        }
+        hookFeeQuoters[hook] = quoter;
+        emit SetHookFeeQuoter(hook, quoter);
+    }
+
+    function _feeObligation(PositionState memory state, uint128 fees0, uint128 fees1)
+        internal view returns (uint256 owed0, uint256 owed1)
+    {
+        address hook = address(state.poolKey.hooks);
+        if (hook == address(0)) return (0,0);
+        address quoter = hookFeeQuoters[hook];
+        if (quoter == address(0)) revert HookFeeQuoterNotConfigured(hook);
+        if (quoter == address(this)) return (0,0);
+        (owed0, owed1) = IPositionFeeQuoter(quoter).quoteProtocolFees(state.tokenId,fees0,fees1);
+        // The hook takes its whole obligation in the fee-first INCREASE(0) of every removal (a remainder
+        // reverts with ProtocolFeesUnsettled) and narrows the take with SafeCast.toInt128, so an obligation
+        // at or beyond 2^127 blocks every decrease of the position. Like fees and principal it is reported
+        // instead of netted, which would have left the other currency counted as collateral (V4LE-113).
+        if (owed0 >= V4_SETTLEMENT_BOUND || owed1 >= V4_SETTLEMENT_BOUND) {
+            revert SettlementBoundExceeded();
+        }
+    }
+
+    function _netCurrency(uint256 principal, uint128 fees, uint256 owed)
+        internal pure returns (uint256 netPrincipal, uint128 netFees)
+    {
+        if (owed <= fees) return (principal, uint128(uint256(fees)-owed));
+        uint256 principalCharge = owed - fees;
+        return (principal > principalCharge ? principal-principalCharge : 0, 0);
+    }
+
+    function _netAmounts(PositionState memory state, uint256 amount0, uint256 amount1, uint128 fees0, uint128 fees1)
+        internal view returns (uint256,uint256,uint128,uint128)
+    {
+        (uint256 owed0,uint256 owed1) = _feeObligation(state,fees0,fees1);
+        (amount0,fees0) = _netCurrency(amount0,fees0,owed0);
+        (amount1,fees1) = _netCurrency(amount1,fees1,owed1);
+        return (amount0,amount1,fees0,fees1);
+    }
+
+    /// @dev Values the position net of its fee obligations (fees first, then principal) in the quote
+    ///      token. Each price-times-amount term is a 512-bit product (an extreme-tick price is ~2^224
+    ///      in Q96), so it is divided by the quote price with full precision instead of as a checked
+    ///      uint256 product, which overflowed for valid positions even though the quotient fits.
+    function _netValues(
+        PositionState memory state,
+        uint256 amount0,
+        uint256 amount1,
+        uint128 fees0,
+        uint128 fees1,
+        uint256 owed0,
+        uint256 owed1,
+        uint256 priceTokenX96
+    ) internal pure returns (uint256 value, uint256 feeValue) {
+        (amount0, fees0) = _netCurrency(amount0, fees0, owed0);
+        (amount1, fees1) = _netCurrency(amount1, fees1, owed1);
+        value = FullMath.mulDiv(state.price0X96, amount0 + fees0, priceTokenX96)
+            + FullMath.mulDiv(state.price1X96, amount1 + fees1, priceTokenX96);
+        feeValue = FullMath.mulDiv(state.price0X96, fees0, priceTokenX96)
+            + FullMath.mulDiv(state.price1X96, fees1, priceTokenX96);
+    }
+
+    /// @notice Size a fee-first withdrawal, accounting for fixed liabilities consuming principal.
+    /// @dev One position-state load (sequencer guard, feed / TWAP reads, quoter calls) serves both the
+    ///      value the target is compared against and the sizing itself. The raw prices are returned so
+    ///      the caller values the removal's actual proceeds at full precision, see `IV4Oracle` (V4LE-104).
+    function getLiquidityForValue(uint256 tokenId, address quoteToken, uint256 target)
+        external
+        view
+        returns (uint128, uint256 price0X96, uint256 price1X96, uint256 quotePrice)
+    {
+        PositionState memory state = _loadPositionState(tokenId);
+        (uint256 a0,uint256 a1) = _getAmounts(state);
+        (uint128 f0,uint128 f1) = _getFees(state);
+        (uint256 owed0,uint256 owed1) = _feeObligation(state,f0,f1);
+        quotePrice = _quoteTokenPrice(state, quoteToken);
+        price0X96 = state.price0X96;
+        price1X96 = state.price1X96;
+        uint256 c0 = owed0 > f0 ? owed0-f0 : 0;
+        uint256 c1 = owed1 > f1 ? owed1-f1 : 0;
+        // A charge is paid from the principal the removal releases, which v4 pays at the live price, not
+        // from the derived composition that is valued: the funding floors below are sized on the live
+        // payout, and a charge the whole position's live payout cannot cover is reported instead of a
+        // removal whose unlock v4 would reject (Codex, PR #45).
+        (uint256 live0, uint256 live1) = _liveAmounts(state);
+        if (live0 < c0 || live1 < c1) revert HookChargeUnfundable();
+        (uint256 value,uint256 netFeeValue) = _netValues(state,a0,a1,f0,f1,owed0,owed1,quotePrice);
+        if (target >= value) return (state.liquidity, price0X96, price1X96, quotePrice);
+        uint256 charge = Math.mulDiv(c0,state.price0X96,quotePrice,Math.Rounding.Ceil)
+            + Math.mulDiv(c1,state.price1X96,quotePrice,Math.Rounding.Ceil);
+        uint256 principalValue = FullMath.mulDiv(a0,state.price0X96,quotePrice)
+            + FullMath.mulDiv(a1,state.price1X96,quotePrice);
+        uint256 needed = target + charge > netFeeValue ? target + charge - netFeeValue : 0;
+        // A principal whose floored quote is zero (each leg worth less than one quote unit, e.g. a sub-Q96
+        // per-unit price with a real amount) cannot be split by value; when more value is still needed the
+        // sizing is all of it rather than a division by zero (V4LE-139).
+        uint256 liquidity = needed == 0
+            ? 0
+            : principalValue == 0
+                ? state.liquidity
+                : Math.mulDiv(needed,state.liquidity,principalValue,Math.Rounding.Ceil);
+        // Each charged currency must also be funded from what v4 pays out of it at the live price: surplus
+        // of the other currency cannot settle it (live_i >= c_i > 0 here, see above).
+        if (c0 != 0) liquidity = Math.max(liquidity, Math.mulDiv(c0, state.liquidity, live0, Math.Rounding.Ceil));
+        if (c1 != 0) liquidity = Math.max(liquidity, Math.mulDiv(c1, state.liquidity, live1, Math.Rounding.Ceil));
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return (uint128(Math.min(liquidity,state.liquidity)), price0X96, price1X96, quotePrice);
+    }
+
+    // token => config mapping
+    mapping(address => TokenConfig) public feedConfigs;
+
+    uint16 public maxPoolPriceDifference; // Max price difference x10000
+
+    // Feed to check sequencer up on L2s - address(0) when not needed
+    address public sequencerUptimeFeed;
+
+    // Address which can call emergency source-mode changes without the owner.
+    address public emergencyAdmin;
+
+    /// @dev Constructor for V4Oracle deployment
+    /// @notice Initializes the V4Oracle contract with core V4 components
+    /// @param _positionManager The Uniswap V4 PositionManager contract instance
+    /// @param _referenceToken Token used as reference for price calculations (typically WETH or USDC)
+    /// @param _chainlinkReferenceToken Token used as base currency for Chainlink feeds (typically USD-linked token)
+    constructor(IPositionManager _positionManager, address _referenceToken, address _chainlinkReferenceToken)
+        Ownable(msg.sender)
+    {
+        if (_chainlinkReferenceToken == address(0)) {
+            revert InvalidConfig();
+        }
+        poolManager = _positionManager.poolManager();
+        positionManager = _positionManager;
+        referenceToken = _referenceToken;
+        referenceTokenDecimals = IERC20Metadata(_referenceToken).decimals();
+        _requireBoundedSupply(_referenceToken);
+        chainlinkReferenceToken = _chainlinkReferenceToken;
+    }
+
+    /// @notice Calculates "pool price" using configured oracle sources
+    /// @dev Calculates price of a token in quote token terms using the configured source mode.
+    ///      Reverts if token or quoteToken is not configured (except reference token shortcuts).
+    /// @param token0 Token address to get price for (use address(0) for native ETH)
+    /// @param token1 Token address to quote the price in (use address(0) for native ETH)
+    /// @return priceX96 Price of token in quote token terms in X96
+    function getPoolSqrtPriceX96(address token0, address token1) external view returns (uint160) {
+        if (token0 == token1) {
+            return SafeCast.toUint160(Q96);
+        }
+        _requireSequencerUp();
+
+        (uint256 price0X96, uint256 chainlinkReferencePriceX96) = _getReferenceTokenPriceX96(token0, 0);
+        (uint256 price1X96,) = _getReferenceTokenPriceX96(token1, chainlinkReferencePriceX96);
+        uint256 sqrtPriceX96 = _sqrtPriceX96FromPriceX96(FullMath.mulDiv(price0X96, Q96, price1X96));
+        // Callers use this value numerically (swap floors, oracle ticks), so a ratio outside the
+        // sqrt-price domain is reported as such instead of surfacing as a SafeCast revert (above)
+        // or a silent zero (below).
+        if (sqrtPriceX96 < TickMath.MIN_SQRT_PRICE || sqrtPriceX96 > TickMath.MAX_SQRT_PRICE) {
+            revert SqrtPriceOutOfRange();
+        }
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return uint160(sqrtPriceX96);
+    }
+
+    /// @notice Gets value of a V4 position in a specific token
+    /// @dev Calculates position value using liquidity amount + uncollected fees at current Oracle prices
+    /// @param tokenId Token ID of the position NFT to be valued
+    /// @param token Token address to quote the position value in (use address(0) for native ETH)
+    /// @return value Total value of complete position (liquidity + fees) at Oracle prices in the specified token
+    /// @return feeValue Value of uncollected fees only at Oracle prices in the specified token
+    /// @return price0X96 Price of token0 normalized to Q96 format in the specified token
+    /// @return price1X96 Price of token1 normalized to Q96 format in the specified token
+    function getValue(uint256 tokenId, address token)
+        public
+        view
+        override
+        returns (uint256 value, uint256 feeValue, uint256 price0X96, uint256 price1X96)
+    {
+        PositionState memory state = _loadPositionState(tokenId);
+        (uint256 amount0, uint256 amount1) = _getAmounts(state);
+        (uint128 fees0, uint128 fees1) = _getFees(state);
+        (uint256 owed0, uint256 owed1) = _feeObligation(state, fees0, fees1);
+
+        uint256 priceTokenX96 = _quoteTokenPrice(state, token);
+
+        (value, feeValue) = _netValues(state, amount0, amount1, fees0, fees1, owed0, owed1, priceTokenX96);
+        price0X96 = FullMath.mulDiv(state.price0X96, Q96, priceTokenX96);
+        price1X96 = FullMath.mulDiv(state.price1X96, Q96, priceTokenX96);
+    }
+
+    function _quoteTokenPrice(PositionState memory state, address token) internal view returns (uint256 price) {
+        if (state.currency0 == Currency.wrap(token)) return state.price0X96;
+        if (state.currency1 == Currency.wrap(token)) return state.price1X96;
+        (price,) = _getReferenceTokenPriceX96(token, state.cachedChainlinkReferencePriceX96);
+    }
+
+    /// @notice Gets liquidity and uncollected fees for a V4 position by tokenId
+    /// @dev Calculates current position liquidity and uncollected trading fees following Uniswap V4 methodology
+    /// @param tokenId Token ID of the position NFT to analyze
+    /// @return liquidity Current liquidity amount remaining in the position
+    /// @return fees0 Uncollected token0 fees that have accrued since last collection
+    /// @return fees1 Uncollected token1 fees that have accrued since last collection
+    function getLiquidityAndFees(uint256 tokenId)
+        external
+        view
+        override
+        returns (uint128 liquidity, uint128 fees0, uint128 fees1)
+    {
+        PositionState memory state = _loadPositionState(tokenId);
+
+        // Get position liquidity
+        liquidity = state.liquidity;
+
+        // Get uncollected fees
+        (fees0, fees1) = _getFees(state);
+    }
+
+    /// @notice Gets comprehensive breakdown of a V4 position
+    /// @dev Returns all essential position data including currencies, liquidity, token amounts, and fees
+    /// @param tokenId Token ID of the position NFT to analyze
+    /// @return currency0 Currency struct representing token0 of the position (use Currency.unwrap() to get address)
+    /// @return currency1 Currency struct representing token1 of the position (use Currency.unwrap() to get address)
+    /// @return fee Fee tier of the position in basis points (e.g., 3000 = 0.3%)
+    /// @return liquidity Current liquidity amount in the position
+    /// @return amount0 Current token amount of token0 based on oracle-derived price
+    /// @return amount1 Current token amount of token1 based on oracle-derived price
+    /// @return fees0 Uncollected token0 fees accrued by the position
+    /// @return fees1 Uncollected token1 fees accrued by the position
+    function getPositionBreakdown(uint256 tokenId)
+        external
+        view
+        override
+        returns (
+            Currency currency0,
+            Currency currency1,
+            uint24 fee,
+            uint128 liquidity,
+            uint256 amount0,
+            uint256 amount1,
+            uint128 fees0,
+            uint128 fees1
+        )
+    {
+        PositionState memory state = _loadPositionState(tokenId);
+        (amount0, amount1) = _getAmounts(state);
+        (fees0, fees1) = _getFees(state);
+        (amount0,amount1,fees0,fees1) = _netAmounts(state,amount0,amount1,fees0,fees1);
+        liquidity = state.liquidity;
+        // Extract basic position data
+        currency0 = state.currency0;
+        currency1 = state.currency1;
+        fee = state.fee;
+    }
+
+    /// @notice Sets or updates the oracle configuration for a token (requires owner privileges)
+    /// @dev Configures Chainlink-compatible feed and optional Uniswap v3 TWAP verification.
+    ///      This controls whether the token can be used in:
+    ///      - Vault loan valuation/health checks
+    ///      - Oracle slippage checks in automators/rehook (when slippage != 10000)
+    /// @param token Token address to configure (use address(0) for native ETH)
+    /// @param feed Valid Chainlink-compatible AggregatorV3Interface contract address for price data
+    /// @param maxFeedAge Maximum age of feed data in seconds before considering stale
+    /// @param twapPool Uniswap v3 pool containing twapTokenAlias and referenceToken
+    /// @param twapTokenAlias Token represented in twapPool, e.g. WETH for native ETH
+    /// @param twapSeconds TWAP window used by modes that read TWAP
+    /// @param mode Oracle source mode
+    /// @param maxDifference Maximum source price difference expressed in basis points
+    function setTokenConfig(
+        address token,
+        AggregatorV3Interface feed,
+        uint32 maxFeedAge,
+        IUniswapV3Pool twapPool,
+        address twapTokenAlias,
+        uint32 twapSeconds,
+        Mode mode,
+        uint16 maxDifference
+    ) external onlyOwner {
+        if (!_isValidMode(mode) || address(feed) == address(0)) {
+            revert InvalidConfig();
+        }
+        _requireBoundedSupply(token);
+
+        uint8 feedDecimals = feed.decimals();
+        uint8 tokenDecimals = address(token) == address(0) ? 18 : IERC20Metadata(token).decimals();
+        address effectiveTwapToken = twapTokenAlias == address(0) && token != address(0) ? token : twapTokenAlias;
+        // The TWAP leg is read in the alias's raw unit and applied to the token's, so the alias must carry
+        // the token's decimals; the token itself as its own alias has them by definition (V4LE-147).
+        if (
+            effectiveTwapToken != address(0) && effectiveTwapToken != token
+                && IERC20Metadata(effectiveTwapToken).decimals() != tokenDecimals
+        ) {
+            revert InvalidConfig();
+        }
+
+        bool twapTokenIsToken0;
+        if (_usesTWAP(mode)) {
+            if (effectiveTwapToken == address(0)) {
+                revert InvalidConfig();
+            }
+            // @custom:accepted-risk AUDIT-ACCEPTED-ORACLE-ZERO-TWAP-SPOT
+            // twapSeconds == 0 is intentionally allowed and makes the reference read the pool's slot0
+            // spot (v3-like), see _getReferencePoolPriceX96 and testZeroTwapWindowUsesPoolSpotLikeV3.
+            // The owner opts into this per token; spot is manipulable within a block, so it must only be
+            // configured for references where that is acceptable. A non-zero window is required otherwise (M-6b).
+            twapTokenIsToken0 = _validateTWAPPool(twapPool, effectiveTwapToken);
+        } else if (address(twapPool) != address(0)) {
+            if (effectiveTwapToken == address(0)) {
+                revert InvalidConfig();
+            }
+            twapTokenIsToken0 = _validateTWAPPool(twapPool, effectiveTwapToken);
+        }
+
+        TokenConfig memory config = TokenConfig(
+            feed,
+            maxFeedAge,
+            feedDecimals,
+            tokenDecimals,
+            twapSeconds,
+            twapPool,
+            effectiveTwapToken,
+            twapTokenIsToken0,
+            mode,
+            maxDifference
+        );
+
+        feedConfigs[token] = config;
+        emit TokenConfigUpdated(token, config);
+        emit OracleModeUpdated(token, mode);
+    }
+
+    /// @notice Updates the oracle source mode for a token.
+    /// @dev Intended for emergency mode changes without rewriting full token configuration.
+    function setOracleMode(address token, Mode mode) external {
+        if (msg.sender != emergencyAdmin && msg.sender != owner()) {
+            revert Unauthorized();
+        }
+        if (!_isValidMode(mode)) {
+            revert InvalidConfig();
+        }
+        feedConfigs[token].mode = mode;
+        emit OracleModeUpdated(token, mode);
+    }
+
+    /// @notice Sets the address allowed to perform emergency mode switches.
+    function setEmergencyAdmin(address admin) external onlyOwner {
+        emergencyAdmin = admin;
+        emit SetEmergencyAdmin(admin);
+    }
+
+    /// @notice Sets the maximum price difference parameter for validation (requires owner privileges)
+    /// @dev Controls price deviation tolerance between different 

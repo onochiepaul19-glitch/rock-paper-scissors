@@ -1,0 +1,463 @@
+}
+        }
+
+        emit Repay(tokenId, msg.sender, tokenOwner[tokenId], assets, shares);
+    }
+
+    function _getPositionTokens(uint256 tokenId) internal view returns (Currency token0, Currency token1) {
+        (PoolKey memory poolKey,) = positionManager.getPoolAndPositionInfo(tokenId);
+        token0 = poolKey.currency0;
+        token1 = poolKey.currency1;
+    }
+
+    // checks how much balance is available
+    function _getBalanceAndReserves(uint256 debtExchangeRateX96, uint256 lendExchangeRateX96)
+        internal
+        view
+        returns (uint256 balance, uint256 reserves)
+    {
+        balance = Currency.wrap(asset).balanceOfSelf();
+        uint256 debt = _convertToAssets(debtSharesTotal, debtExchangeRateX96, Math.Rounding.Ceil);
+        uint256 lent = _convertToAssets(totalSupply(), lendExchangeRateX96, Math.Rounding.Ceil);
+        reserves = balance + debt > lent ? balance + debt - lent : 0;
+    }
+
+    // removes the liquidation share from the position and pays it out
+    // returns the amounts the liquidator (params.recipient) actually received
+    function _sendPositionValue(LiquidateParams calldata params, LiquidateState memory state)
+        internal
+        returns (uint256 amount0, uint256 amount1)
+    {
+        // when the uncollected fees alone cover the liquidation value the oracle sizes no liquidity
+        // and the collected fees are split between liquidator and owner by value share
+        uint128 liquidity;
+        (liquidity, state.price0X96, state.price1X96, state.quotePriceX96) =
+            oracle.getLiquidityForValue(params.tokenId, asset, state.liquidationValue);
+        bool feesOnly = liquidity == 0;
+
+        (uint256 received0, uint256 received1) = _decreaseLiquidity(
+            params.tokenId, liquidity, 0, 0, params.deadline, params.decreaseLiquidityHookData, address(this)
+        );
+
+        // The quote (fullValue, feeValue, liquidationValue) is oracle-priced and taken before the removal,
+        // while the amounts that actually come out are settled at the live pool price (up to
+        // maxPoolPriceDifference away) and include whatever the pool hook credits to the position in its
+        // before-remove callback (an auction drip donated to in-range liquidity). Both can make the removal
+        // worth more than the quote at the oracle's own prices. The liquidator's share is what the quote
+        // authorizes: liquidationValue out of the value the removal was sized on, and never more than
+        // liquidationValue worth at oracle prices. Anything above stays with the loan owner. Receiving less
+        // (a hook skim, a pool price below the oracle) is the liquidator's risk, covered by the penalty; the
+        // split is applied to what was actually received so a skim is carried proportionally (L-02).
+        // The received amounts are valued with the oracle's raw prices, exactly as the oracle values the
+        // position: a per-leg price first rounded to Q96 in asset terms is zero for a leg worth less than
+        // one asset unit per raw unit, which would drop that leg from the cap and hand all of it to the
+        // liquidator (V4LE-104).
+        uint256 base = feesOnly ? state.feeValue : state.liquidationValue;
+        uint256 receivedValue = received0.mulDiv(state.price0X96, state.quotePriceX96)
+            + received1.mulDiv(state.price1X96, state.quotePriceX96);
+        if (receivedValue > base) {
+            base = receivedValue;
+        }
+        if (base > 0) {
+            amount0 = received0.mulDiv(state.liquidationValue, base);
+            amount1 = received1.mulDiv(state.liquidationValue, base);
+        }
+
+        (Currency currency0, Currency currency1) = _getPositionTokens(params.tokenId);
+        address owner = tokenOwner[params.tokenId];
+        _payLiquidationProceeds(currency0, amount0, received0 - amount0, params.recipient, owner);
+        _payLiquidationProceeds(currency1, amount1, received1 - amount1, params.recipient, owner);
+    }
+
+    // pays the liquidator's share and hands the remainder to the loan owner. Native ETH is wrapped so a
+    // reverting owner cannot block the liquidation. Rejected ERC20 surplus is escrowed for the owner.
+    function _payLiquidationProceeds(
+        Currency currency,
+        uint256 share,
+        uint256 remainder,
+        address recipient,
+        address owner
+    ) internal {
+        if (share > 0) {
+            currency.transfer(recipient, share);
+        }
+        if (remainder > 0) {
+            address token = Currency.unwrap(currency);
+            if (currency.isAddressZero()) {
+                weth.deposit{value: remainder}();
+                token = address(weth);
+            }
+            if (!_tryTransfer(token, owner, remainder)) {
+                SafeERC20.safeTransfer(IERC20(token), address(liquidationEscrow), remainder);
+                liquidationEscrow.credit(token, owner, remainder);
+            }
+        }
+    }
+
+    // ERC20 transfer that reports failure instead of reverting
+    function _tryTransfer(address token, address to, uint256 amount) internal returns (bool) {
+        (bool success, bytes memory data) = token.call(abi.encodeCall(IERC20.transfer, (to, amount)));
+        return success && (data.length == 0 || (data.length >= 32 && abi.decode(data, (bool))));
+    }
+
+    // decreases liquidity from uniswap v4 position
+    function _decreaseLiquidity(
+        uint256 tokenId,
+        uint128 liquidityRemove,
+        uint256 amount0Min,
+        uint256 amount1Min,
+        uint256 deadline,
+        bytes memory decreaseLiquidityHookData,
+        address recipient
+    ) internal returns (uint256 amount0, uint256 amount1) {
+        (bool ok, bytes memory result) = address(positionActions).delegatecall(abi.encodeCall(
+            positionActions.decreaseLiquidity,
+            (tokenId,liquidityRemove,amount0Min,amount1Min,deadline,decreaseLiquidityHookData,recipient)
+        ));
+        if (!ok) {
+            assembly ("memory-safe") { revert(add(result,32),mload(result)) }
+        }
+        return abi.decode(result,(uint256,uint256));
+    }
+
+    // cleans up loan when it is closed because of replacement, repayment or liquidation
+    // the position is kept in the contract, but can be removed with remove() method
+    // because loanShares are 0
+    function _cleanupLoan(uint256 tokenId, uint256 debtExchangeRateX96, uint256 lendExchangeRateX96) internal {
+        _updateAndCheckCollateral(tokenId, debtExchangeRateX96, lendExchangeRateX96, loans[tokenId].debtShares, 0);
+        delete loans[tokenId];
+    }
+
+    function _checkNotLiquidating(uint256 tokenId) internal view {
+        if (liquidatingTokenId != 0 && liquidatingTokenId == tokenId) {
+            revert Reentrancy();
+        }
+    }
+
+    // calculates amount which needs to be payed to liquidate position
+    //  if position is too valuable - not all of the position is liquididated - only needed amount
+    //  if position is not valuable enough - missing part is covered by reserves - if not enough reserves - collectively by other borrowers
+    function _calculateLiquidation(uint256 debt, uint256 fullValue, uint256 collateralValue)
+        internal
+        pure
+        returns (uint256 liquidationValue, uint256 liquidatorCost, uint256 reserveCost)
+    {
+        // in a standard liquidation - liquidator pays complete debt (and get part or all of position)
+        // if position has less than enough value - liquidation cost maybe less - rest is payed by protocol or lenders collectively
+        liquidatorCost = debt;
+
+        // position value needed to pay debt at max penalty
+        uint256 maxPenaltyValue = debt * (Q32 + MAX_LIQUIDATION_PENALTY_X32) / Q32;
+
+        // if position is more valuable than debt with max penalty
+        if (fullValue >= maxPenaltyValue) {
+            if (collateralValue > 0) {
+                // position value when position started to be liquidatable. Full-precision
+                // division: debt and fullValue can each approach 2^144 for a valid large position,
+                // so the checked product would overflow and block loanInfo() and liquidate().
+                uint256 startLiquidationValue = Math.mulDiv(debt, fullValue, collateralValue);
+                uint256 penaltyFractionX96 =
+                    (Q96 - Math.mulDiv(fullValue - maxPenaltyValue, Q96, startLiquidationValue - maxPenaltyValue));
+                uint256 penaltyX32 = MIN_LIQUIDATION_PENALTY_X32
+                    + (MAX_LIQUIDATION_PENALTY_X32 - MIN_LIQUIDATION_PENALTY_X32) * penaltyFractionX96 / Q96;
+
+                liquidationValue = debt * (Q32 + penaltyX32) / Q32;
+            } else {
+                liquidationValue = maxPenaltyValue;
+            }
+        } else {
+            uint256 penalty = debt * MAX_LIQUIDATION_PENALTY_X32 / Q32;
+
+            // @custom:accepted-risk AUDIT-ACCEPTED-LIQUIDATION-RESERVE-SUBSIDY
+            // When debt <= fullValue < debt*(1+maxPenalty), the liquidator is charged fullValue-penalty
+            // and the shortfall (debt - liquidatorCost) is drawn from reserves even though the collateral
+            // alone still covers the debt. This subsidy (bounded by maxPenalty of debt, from the protocol's
+            // own reserves) is intentional to keep liquidations incentivized right at the solvency boundary (L-a).
+            // if value is enough to pay penalty
+            if (fullValue > penalty) {
+                liquidatorCost = fullValue - penalty;
+            } else {
+                // this extreme case leads to free liquidation
+                liquidatorCost = 0;
+            }
+
+            liquidationValue = fullValue;
+            reserveCost = debt - liquidatorCost; // Remaining to pay is taken from reserves
+        }
+    }
+
+    // calculates if there are enough reserves to cover liquidaton - if not its shared between lenders
+    function _handleReserveLiquidation(
+        uint256 reserveCost,
+        uint256 newDebtExchangeRateX96,
+        uint256 newLendExchangeRateX96
+    ) internal returns (uint256 missing) {
+        (, uint256 reserves) = _getBalanceAndReserves(newDebtExchangeRateX96, newLendExchangeRateX96);
+
+        // if not enough - democratize debt
+        if (reserveCost > reserves) {
+            missing = reserveCost - reserves;
+
+            uint256 totalLent = _convertToAssets(totalSupply(), newLendExchangeRateX96, Math.Rounding.Ceil);
+
+            // @custom:accepted-risk AUDIT-ACCEPTED-TOTAL-INSOLVENCY-REDEPLOY
+            // If liquidation losses wipe all lender principal, the lender exchange rate
+            // collapses to zero and this vault is treated as redeploy-only afterward.
+            if (totalLent == 0 || missing >= totalLent) {
+                newLendExchangeRateX96 = 0;
+            } else {
+                // Distribute the missing amount proportionally across all lent assets.
+                newLendExchangeRateX96 = (totalLent - missing) * newLendExchangeRateX96 / totalLent;
+            }
+            lastLendExchangeRateX96 = newLendExchangeRateX96;
+            emit ExchangeRateUpdate(newDebtExchangeRateX96, newLendExchangeRateX96);
+
+            // the same-day lend allowance was sized on claims that were just written off: never let a
+            // later deposit consume more than a fresh day's allowance on the surviving claims would grant
+            uint256 allowance =
+                _calculateDailyLimit(newLendExchangeRateX96, dailyLendIncreaseLimitMin, MAX_DAILY_LEND_INCREASE_X32);
+            if (dailyLendIncreaseLimitLeft > allowance) {
+                dailyLendIncreaseLimitLeft = allowance;
+            }
+        }
+    }
+
+    function _calculateTokenCollateralFactorX32(uint256 tokenId) internal view returns (uint32) {
+        // Get position info to determine currencies
+        (Currency currency0, Currency currency1) = _getPositionTokens(tokenId);
+        uint32 factor0X32 = tokenConfigs[Currency.unwrap(currency0)].collateralFactorX32;
+        uint32 factor1X32 = tokenConfigs[Currency.unwrap(currency1)].collateralFactorX32;
+        return factor0X32 > factor1X32 ? factor1X32 : factor0X32;
+    }
+
+    function _updateGlobalInterest() internal returns (uint256 newDebtExchangeRateX96, uint256 newLendExchangeRateX96) {
+        // only needs to be updated once per block (when needed)
+        if (block.timestamp > lastExchangeRateUpdate) {
+            (newDebtExchangeRateX96, newLendExchangeRateX96) = _calculateGlobalInterest();
+            lastDebtExchangeRateX96 = newDebtExchangeRateX96;
+            lastLendExchangeRateX96 = newLendExchangeRateX96;
+            lastExchangeRateUpdate = uint64(block.timestamp); // never overflows in a loooooong time
+            emit ExchangeRateUpdate(newDebtExchangeRateX96, newLendExchangeRateX96);
+        } else {
+            newDebtExchangeRateX96 = lastDebtExchangeRateX96;
+            newLendExchangeRateX96 = lastLendExchangeRateX96;
+        }
+    }
+
+    function _calculateGlobalInterest()
+        internal
+        view
+        returns (uint256 newDebtExchangeRateX96, uint256 newLendExchangeRateX96)
+    {
+        uint256 oldDebtExchangeRateX96 = lastDebtExchangeRateX96;
+        uint256 oldLendExchangeRateX96 = lastLendExchangeRateX96;
+
+        // always growing or equal
+        uint256 lastRateUpdate = lastExchangeRateUpdate;
+        uint256 timeElapsed = (block.timestamp - lastRateUpdate);
+
+        if (timeElapsed > 0 && lastRateUpdate != 0) {
+            (uint256 balance,) = _getBalanceAndReserves(oldDebtExchangeRateX96, oldLendExchangeRateX96);
+            uint256 debt = _convertToAssets(debtSharesTotal, oldDebtExchangeRateX96, Math.Rounding.Ceil);
+            (uint256 borrowRateX64, uint256 supplyRateX64) = interestRateModel.getRatesPerSecondX64(balance, debt);
+            supplyRateX64 = supplyRateX64.mulDiv(Q32 - reserveFactorX32, Q32);
+
+            newDebtExchangeRateX96 = oldDebtExchangeRateX96 + oldDebtExchangeRateX96 * timeElapsed * borrowRateX64 / Q64;
+            newLendExchangeRateX96 = oldLendExchangeRateX96 + oldLendExchangeRateX96 * timeElapsed * supplyRateX64 / Q64;
+        } else {
+            newDebtExchangeRateX96 = oldDebtExchangeRateX96;
+            newLendExchangeRateX96 = oldLendExchangeRateX96;
+        }
+    }
+
+    function _requireLoanIsHealthy(uint256 tokenId, uint256 debt) internal view {
+        (bool isHealthy,,,,,) = _checkLoanIsHealthy(tokenId, debt);
+        if (!isHealthy) {
+            revert CollateralFail();
+        }
+    }
+
+    // updates collateral token configs - and check if limit is not surpassed (check is only done on increasing debt shares)
+    function _updateAndCheckCollateral(
+        uint256 tokenId,
+        uint256 debtExchangeRateX96,
+        uint256 lendExchangeRateX96,
+        uint256 oldShares,
+        uint256 newShares
+    ) internal {
+        if (oldShares != newShares) {
+            (Currency currency0, Currency currency1) = _getPositionTokens(tokenId);
+            address token0 = Currency.unwrap(currency0);
+            address token1 = Currency.unwrap(currency1);
+
+            // remove previous collateral - add new collateral
+            if (oldShares > newShares) {
+                uint192 difference = _toUint192(oldShares - newShares);
+                tokenConfigs[token0].totalDebtShares -= difference;
+                tokenConfigs[token1].totalDebtShares -= difference;
+            } else {
+                uint192 difference = _toUint192(newShares - oldShares);
+                tokenConfigs[token0].totalDebtShares += difference;
+                tokenConfigs[token1].totalDebtShares += difference;
+
+                uint256 lentAssets = _settledLentAssets(lendExchangeRateX96);
+                _checkTokenDebtLimit(token0, debtExchangeRateX96, lentAssets);
+                _checkTokenDebtLimit(token1, debtExchangeRateX96, lentAssets);
+            }
+        }
+    }
+
+    function _checkTokenDebtLimit(address token, uint256 rate, uint256 lentAssets) internal view {
+        TokenConfig storage config = tokenConfigs[token];
+        uint256 debt = _convertToAssets(config.totalDebtShares, rate, Math.Rounding.Ceil);
+        uint256 factor = config.collateralValueLimitFactorX32;
+        uint256 budget = tokenDebtLimits[token];
+        if (budget == 0) {
+            budget = factor == type(uint32).max ? globalDebtLimit : globalDebtLimit.mulDiv(factor, Q32);
+        }
+        if (debt > budget || (factor < type(uint32).max && debt > lentAssets.mulDiv(factor, Q32))) {
+            revert CollateralValueLimit();
+        }
+    }
+
+    /// @dev Lender supply the supply-relative bounds are measured against: the lent assets net of the
+    ///      unsettled inflow, i.e. the net inflow recorded since the last daily lend reset (only while
+    ///      that reset is today's; an older record is stale and ignored) beyond the governance minimum
+    ///      daily lend allowance, which counts at once so a small or new vault can bootstrap. Interest
+    ///      accrual raises it immediately, larger deposits from the next day on, withdrawals of settled
+    ///      supply at once.
+    function _settledLentAssets(uint256 lendExchangeRateX96) internal view returns (uint256) {
+        uint256 lentAssets = _convertToAssets(totalSupply(), lendExchangeRateX96, Math.Rounding.Ceil);
+        uint256 inflow = dailyLendIncreaseLimitLastReset == uint32(block.timestamp / 1 days) ? dailyLendNetInflow : 0;
+        uint256 unsettled = inflow > dailyLendIncreaseLimitMin ? inflow - dailyLendIncreaseLimitMin : 0;
+        return lentAssets > unsettled ? lentAssets - unsettled : 0;
+    }
+
+    function _resetDailyLendIncreaseLimit(uint256 newLendExchangeRateX96, bool force) internal {
+        uint32 time = uint32(block.timestamp / 1 days);
+        if (force || time > dailyLendIncreaseLimitLastReset) {
+            // a new day settles the previous day's inflow into the supply the bounds are sized on
+            dailyLendNetInflow = 0;
+            dailyLendIncreaseLimitLeft =
+                _calculateDailyLimit(newLendExchangeRateX96, dailyLendIncreaseLimitMin, MAX_DAILY_LEND_INCREASE_X32);
+            dailyLendIncreaseLimitLastReset = time;
+        }
+    }
+
+    function _resetDailyDebtIncreaseLimit(uint256 newLendExchangeRateX96, bool force) internal {
+        uint32 time = uint32(block.timestamp / 1 days);
+        if (force || time > dailyDebtIncreaseLimitLastReset) {
+            dailyDebtIncreaseLimitLeft =
+                _calculateDailyLimit(newLendExchangeRateX96, dailyDebtIncreaseLimitMin, MAX_DAILY_DEBT_INCREASE_X32);
+            dailyDebtIncreaseLimitLastReset = time;
+        }
+    }
+
+    function _calculateDailyLimit(uint256 newLendExchangeRateX96, uint256 limitMin, uint32 maxFactorX32)
+        internal
+        view
+        returns (uint256)
+    {
+        // sized on the settled supply: a same-day deposit cannot widen the day's quota (V4LE-127)
+        uint256 increaseLimit = _settledLentAssets(newLendExchangeRateX96) * maxFactorX32 / Q32;
+        return limitMin > increaseLimit ? limitMin : increaseLimit;
+    }
+
+    function _checkLoanIsHealthy(uint256 tokenId, uint256 debt)
+        internal
+        view
+        returns (
+            bool isHealthy,
+            uint256 fullValue,
+            uint256 collateralValue,
+            uint256 feeValue,
+            uint256 price0X96,
+            uint256 price1X96
+        )
+    {
+        (fullValue, feeValue, price0X96, price1X96) = oracle.getValue(tokenId, address(asset));
+        uint256 collateralFactorX32 = _calculateTokenCollateralFactorX32(tokenId);
+        collateralValue = fullValue.mulDiv(collateralFactorX32, Q32);
+        isHealthy = collateralValue >= debt;
+    }
+
+    function _convertToShares(uint256 amount, uint256 exchangeRateX96, Math.Rounding rounding)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (amount == 0) {
+            return 0;
+        }
+        if (exchangeRateX96 == 0) {
+            revert InvalidConfig();
+        }
+        return amount.mulDiv(Q96, exchangeRateX96, rounding);
+    }
+
+    function _convertToAssets(uint256 shares, uint256 exchangeRateX96, Math.Rounding rounding)
+        internal
+        pure
+        returns (uint256)
+    {
+        return shares.mulDiv(exchangeRateX96, Q96, rounding);
+    }
+
+    function _addTokenToOwner(address to, uint256 tokenId) internal {
+        ownedTokensIndex[tokenId] = ownedTokens[to].length;
+        ownedTokens[to].push(tokenId);
+        tokenOwner[tokenId] = to;
+    }
+
+    /// @dev When a transform replaces the NFT, tell the old position's allowlisted hook so it can move
+    ///      its token-id keyed state (configs, triggers) to the replacement, or retire it when the
+    ///      replacement left the hook's pools (different hook, no hook): the loan has moved, so state
+    ///      left on the old token would only orphan trigger nodes. Doing this here covers every
+    ///      transformer that remints without per-transformer wiring. The loan owner's transform
+    ///      approval for the hook is carried over only when the new position is still in one of its
+    ///      pools. A hook revert fails the transform on purpose: it means the migrated automation is
+    ///      invalid for the new position, and the owner must reconfigure or disable it before moving
+    ///      range rather than end up unprotected.
+    function _migrateHookState(address loanOwner, uint256 oldTokenId, uint256 newTokenId) internal {
+        (PoolKey memory oldPoolKey,) = positionManager.getPoolAndPositionInfo(oldTokenId);
+        address oldHook = address(oldPoolKey.hooks);
+        if (oldHook == address(0) || !hookAllowList[oldHook]) {
+            return;
+        }
+        (PoolKey memory newPoolKey,) = positionManager.getPoolAndPositionInfo(newTokenId);
+        if (oldHook == address(newPoolKey.hooks) && transformApprovals[loanOwner][oldTokenId][oldHook]) {
+            transformApprovals[loanOwner][newTokenId][oldHook] = true;
+        }
+        IRemintMigrationHook(oldHook).migrateVaultPosition(oldTokenId, newTokenId);
+    }
+
+    function _checkHookAllowed(uint256 tokenId) internal view {
+        (PoolKey memory poolKey,) = positionManager.getPoolAndPositionInfo(tokenId);
+        if (!hookAllowList[address(poolKey.hooks)]) {
+            revert HookNotAllowed();
+        }
+    }
+
+    function _removeTokenFromOwner(address from, uint256 tokenId) internal {
+        uint256 lastTokenIndex = ownedTokens[from].length - 1;
+        uint256 tokenIndex = ownedTokensIndex[tokenId];
+        if (tokenIndex != lastTokenIndex) {
+            uint256 lastTokenId = ownedTokens[from][lastTokenIndex];
+            ownedTokens[from][tokenIndex] = lastTokenId;
+            ownedTokensIndex[lastTokenId] = tokenIndex;
+        }
+        ownedTokens[from].pop();
+        // Note that ownedTokensIndex[tokenId] is not deleted. There is no need to delete it - gas optimization
+        delete tokenOwner[tokenId]; // Remove the token from the token owner mapping
+    }
+
+    function _toUint192(uint256 value) internal pure returns (uint192) {
+        if (value > type(uint192).max) {
+            revert();
+        }
+        return SafeCast.toUint192(value);
+    }
+
+    // recieves ETH from fees or when decreasing liquidity
+    receive() external payable {}
+}

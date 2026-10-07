@@ -1,0 +1,538 @@
+lMgr.getSlot0(pool.poolIdentifier);
+        if (route.sqrtPrice == 0) revert Invalid_Pool();
+        route.liquidity = pool.poolMgr.getLiquidity(pool.poolIdentifier);
+        uint160 lower = TickMath.getSqrtPriceAtTick(lowerTick);
+        uint160 upper = TickMath.getSqrtPriceAtTick(upperTick);
+        zeroForOne = _shouldSwap0to1(amount0, amount1, route.sqrtPrice, lower, upper);
+        uint16 protocolFee = zeroForOne ? packedProtocolFee.getZeroForOneFee() : packedProtocolFee.getOneForZeroFee();
+        route.feeRate = protocolFee == 0 ? lpFee : protocolFee.calculateSwapFee(lpFee);
+        if (route.feeRate >= MAX_FEE_PIPS) revert Invalid_Fee();
+        route.outputMultiplier = MAX_FEE_PIPS - uint256(outputFeePips);
+        _prepareRoute(route, zeroForOne);
+        // The ending price of every candidate's quote fixes the ratio the range needs there.
+        inputAmount = _solveInputOnQuote(route, amount0, amount1, 0, lower, upper);
+        (outputAmount, sqrtPrice,,) = _quoteThroughTicksState(route, inputAmount);
+        if (outputAmount == 0) inputAmount = 0;
+    }
+
+    function calculateSamePool(
+        V4PoolInfo memory pool,
+        int24 lowerTick,
+        int24 upperTick,
+        uint256 amount0Target,
+        uint256 amount1Target
+    ) external view returns (uint256 inputAmount, uint256 outputAmount, bool swapDir0to1, uint160 sqrtPrice) {
+        if (amount0Target == 0 && amount1Target == 0) return (0, 0, false, 0);
+        if (lowerTick >= upperTick || lowerTick < TickMath.MIN_TICK || upperTick > TickMath.MAX_TICK) {
+            revert Invalid_Tick_Range();
+        }
+        SwapState memory state;
+        uint24 packedProtocolFee;
+        uint24 lpFeeRate;
+        // Populate state with liquidity, price, amounts, and fee
+        {
+            int24 tickValue;
+            (sqrtPrice, tickValue, packedProtocolFee, lpFeeRate) = pool.poolMgr.getSlot0(pool.poolIdentifier);
+            if (sqrtPrice == 0) {
+                revert Invalid_Pool();
+            }
+            uint128 liquidity = pool.poolMgr.getLiquidity(pool.poolIdentifier);
+            int24 tickSpacing = pool.tickSpacing;
+            assembly ("memory-safe") {
+                mstore(state, liquidity) // offset 0x00
+                mstore(add(state, 0x20), sqrtPrice) // offset 0x20
+                mstore(add(state, 0x40), tickValue) // offset 0x40
+                mstore(add(state, 0x60), amount0Target) // offset 0x60
+                mstore(add(state, 0x80), amount1Target) // offset 0x80
+                mstore(add(state, 0x100), tickSpacing) // offset 0x100
+            }
+        }
+        // Calculate sqrt prices at tick bounds
+        uint160 sqrtLower = TickMath.getSqrtPriceAtTick(lowerTick);
+        uint160 sqrtUpper = TickMath.getSqrtPriceAtTick(upperTick);
+        assembly ("memory-safe") {
+            mstore(add(state, 0xa0), sqrtLower) // offset 0xa0
+            mstore(add(state, 0xc0), sqrtUpper) // offset 0xc0
+        }
+        // Determine swap direction
+        swapDir0to1 = _shouldSwap0to1(amount0Target, amount1Target, sqrtPrice, sqrtLower, sqrtUpper);
+        uint16 protocolFee = swapDir0to1 ? packedProtocolFee.getZeroForOneFee() : packedProtocolFee.getOneForZeroFee();
+        state.feeRate = protocolFee == 0 ? lpFeeRate : protocolFee.calculateSwapFee(lpFeeRate);
+        // A 100% total fee is a valid pool state (LPFeeLibrary allows it) but leaves nothing to
+        // swap: both analytic branches divide by (1 - fee). Reject it like calculateSimple does
+        // instead of dividing by zero.
+        if (state.feeRate >= MAX_FEE_PIPS) {
+            revert Invalid_Fee();
+        }
+        // Simulate optimal swap by crossing ticks until direction reverses
+        _traverseTicks(TraverseTicksParams({pool: pool, state: state, sqrtPrice: sqrtPrice, swapDir0to1: swapDir0to1}));
+        // Load final state after crossing ticks
+        uint128 lastLiquidity;
+        uint160 sqrtPriceLast;
+        uint256 lastAmount0;
+        uint256 lastAmount1;
+        assembly ("memory-safe") {
+            lastLiquidity := mload(state)
+            sqrtPriceLast := mload(add(state, 0x20))
+            lastAmount0 := mload(add(state, 0x60))
+            lastAmount1 := mload(add(state, 0x80))
+        }
+        // Zero active liquidity where the traversal stopped (external audit V4LE-89). A valid pool
+        // state: e.g. an exact-limit swap just crossed the sole in-range position's boundary tick and
+        // nothing initialized lies ahead in the swap direction, so every simulated step moved the
+        // price for free without consuming anything. There is nothing left to swap against toward
+        // the target, and both analytic solvers assume liquidity > 0 (they would revert
+        // Math_Overflow, and the hook's caught action consumes the trigger). Return what the
+        // traversal could already commit against real liquidity - in the usual case no swap at all,
+        // with the pool's current price - so the caller gets a deterministic plan.
+        if (lastLiquidity == 0) {
+            unchecked {
+                if (swapDir0to1) {
+                    return (amount0Target - lastAmount0, lastAmount1 - amount1Target, true, sqrtPriceLast);
+                }
+                return (amount1Target - lastAmount1, lastAmount0 - amount0Target, false, sqrtPriceLast);
+            }
+        }
+        // Calculate final swap amounts based on direction
+        unchecked {
+            if (!swapDir0to1) {
+                // Swapping token1 -> token0
+                // If price is below range, try to swap to lower bound
+                if (sqrtPriceLast < sqrtLower) {
+                    sqrtPrice = SqrtPriceMath.getNextSqrtPriceFromAmount1RoundingDown(
+                        sqrtPriceLast,
+                        lastLiquidity,
+                        lastAmount1.mulDiv(MAX_FEE_PIPS - state.feeRate, MAX_FEE_PIPS),
+                        true
+                    );
+                    // If still below range, consume all token1
+                    if (sqrtPrice < sqrtLower) {
+                        inputAmount = amount1Target;
+                    } else {
+                        // Swap to lower bound and update state
+                        lastAmount1 -= SqrtPriceMath.getAmount1Delta(sqrtPriceLast, sqrtLower, lastLiquidity, true)
+                            .mulDiv(MAX_FEE_PIPS, MAX_FEE_PIPS - state.feeRate);
+                        lastAmount0 += SqrtPriceMath.getAmount0Delta(sqrtPriceLast, sqrtLower, lastLiquidity, false);
+                        sqrtPriceLast = sqrtLower;
+                        state.sqrtPrice = sqrtPriceLast;
+                        state.amount0Target = lastAmount0;
+                        state.amount1Target = lastAmount1;
+                    }
+                }
+                // If price is in range, use analytic solution
+                if (sqrtPriceLast >= sqrtLower) {
+                    sqrtPrice = _calculateSwap1to0(state);
+                    inputAmount = amount1Target - lastAmount1
+                        + SqrtPriceMath.getAmount1Delta(sqrtPrice, sqrtPriceLast, lastLiquidity, true)
+                            .mulDiv(MAX_FEE_PIPS, MAX_FEE_PIPS - state.feeRate);
+                }
+                outputAmount = lastAmount0 - amount0Target
+                    + SqrtPriceMath.getAmount0Delta(sqrtPrice, sqrtPriceLast, lastLiquidity, false);
+            } else {
+                // Swapping token0 -> token1
+                // If price is above range, try to swap to upper bound
+                if (sqrtPriceLast > sqrtUpper) {
+                    sqrtPrice = SqrtPriceMath.getNextSqrtPriceFromAmount0RoundingUp(
+                        sqrtPriceLast,
+                        lastLiquidity,
+                        lastAmount0.mulDiv(MAX_FEE_PIPS - state.feeRate, MAX_FEE_PIPS),
+                        true
+                    );
+                    // If still above range, consume all token0
+                    if (sqrtPrice >= sqrtUpper) {
+                        inputAmount = amount0Target;
+                    } else {
+                        // Swap to upper bound and update state
+                        lastAmount0 -= SqrtPriceMath.getAmount0Delta(sqrtUpper, sqrtPriceLast, lastLiquidity, true)
+                            .mulDiv(MAX_FEE_PIPS, MAX_FEE_PIPS - state.feeRate);
+                        lastAmount1 += SqrtPriceMath.getAmount1Delta(sqrtUpper, sqrtPriceLast, lastLiquidity, false);
+                        sqrtPriceLast = sqrtUpper;
+                        state.sqrtPrice = sqrtPriceLast;
+                        state.amount0Target = lastAmount0;
+                        state.amount1Target = lastAmount1;
+                    }
+                }
+                // If price is in range, use analytic solution
+                if (sqrtPriceLast <= sqrtUpper) {
+                    sqrtPrice = _calculateSwap0to1(state);
+                    inputAmount = amount0Target - lastAmount0
+                        + SqrtPriceMath.getAmount0Delta(sqrtPrice, sqrtPriceLast, lastLiquidity, true)
+                            .mulDiv(MAX_FEE_PIPS, MAX_FEE_PIPS - state.feeRate);
+                }
+                outputAmount = lastAmount1 - amount1Target
+                    + SqrtPriceMath.getAmount1Delta(sqrtPrice, sqrtPriceLast, lastLiquidity, false);
+            }
+        }
+    }
+
+    /// @notice Find the next initialized tick in the given direction
+    /// @dev Mirrors TickBitmap.nextInitializedTickWithinOneWord across word boundaries: the left search
+    ///      starts at the current compressed tick, the right search at the one after it. Words further out
+    ///      are entered at bit 255 (left) or bit 0 (right) so no bit is skipped. When the cached word
+    ///      matches the word the search starts in, it is reused instead of reloaded. At most
+    ///      MAX_BITMAP_WORDS_PER_SEARCH words are examined per call; if none holds an initialized tick,
+    ///      the uninitialized tick at the far edge of the last examined word is returned so the caller
+    ///      keeps making progress (crossing it changes no liquidity) and the next call resumes from there.
+    ///      The search ends at the tick domain: once an empty word's far edge lies at or beyond
+    ///      MIN_TICK / MAX_TICK that bound is returned (nothing further can be initialized), so the
+    ///      walk never leaves the domain and never wraps back into it (external audit V4LE-140).
+    /// @param params Search parameters including current tick, direction, and cached bitmap word
+    /// @return result Next initialized tick and the word it was found in
+    function _locateNextTick(NextInitializedTickParams memory params)
+        private
+        view
+        returns (NextInitializedTickResult memory result)
+    {
+        bool searchLeft = params.swapDir0to1;
+        int24 compressedTick = TickBitmap.compress(params.tickValue, params.tickSpacing);
+        if (!searchLeft) compressedTick++;
+        (int16 wordPosition, uint8 bitPosition) = TickBitmap.position(compressedTick);
+        uint256 tickBitmap = params.wordPosition == wordPosition
+            ? params.tickBitmap
+            : params.pool.poolMgr.getTickBitmap(params.pool.poolIdentifier, wordPosition);
+        for (uint256 wordsExamined = 1;; wordsExamined++) {
+            (bool initialized, int24 nextTick) =
+                _findTickInWord(tickBitmap, compressedTick, bitPosition, params.tickSpacing, searchLeft);
+            if (
+                initialized || wordsExamined == MAX_BITMAP_WORDS_PER_SEARCH
+                    || nextTick == (searchLeft ? TickMath.MIN_TICK : TickMath.MAX_TICK)
+            ) {
+                result.nextTick = nextTick;
+                result.wordPosition = wordPosition;
+                result.tickBitmap = tickBitmap;
+                return result;
+            }
+            unchecked {
+                if (searchLeft) {
+                    // Continue from the highest bit of the previous word
+                    compressedTick -= int24(uint24(bitPosition)) + 1;
+                    wordPosition--;
+                    bitPosition = type(uint8).max;
+                } else {
+                    // Continue from the lowest bit of the next word
+                    compressedTick += int24(uint24(type(uint8).max - bitPosition)) + 1;
+                    wordPosition++;
+                    bitPosition = 0;
+                }
+            }
+            tickBitmap = params.pool.poolMgr.getTickBitmap(params.pool.poolIdentifier, wordPosition);
+        }
+    }
+
+    /// @notice Find the next initialized tick within a single bitmap word
+    /// @dev Uses bit manipulation to efficiently find the next set bit. `compressedTick` and
+    ///      `bitPosition` describe the first candidate: the current compressed tick when searching left,
+    ///      the one after it when searching right.
+    /// @param word The 256-bit tick bitmap word
+    /// @param compressedTick The compressed tick the search starts at (inclusive)
+    /// @param bitPosition Bit position of `compressedTick` in the word
+    /// @param tickSpacing The tick spacing
+    /// @param searchLeft Whether to search left (true) or right (false)
+    /// @return initialized Whether an initialized tick was found in the word
+    /// @return nextTick The next initialized tick, or the far edge of the word if none is set, clamped
+    ///         to the tick domain
+    function _findTickInWord(uint256 word, int24 compressedTick, uint8 bitPosition, int24 tickSpacing, bool searchLeft)
+        private
+        pure
+        returns (bool initialized, int24 nextTick)
+    {
+        int256 compressedNext;
+        unchecked {
+            if (searchLeft) {
+                // Mask all bits at or to the right of current position
+                uint256 bitMask = type(uint256).max >> (uint256(type(uint8).max) - bitPosition);
+                uint256 maskedWord = word & bitMask;
+                initialized = maskedWord != 0;
+                // the most significant set bit, or the far (low) edge of the word when none is set
+                uint8 stepBack = initialized ? bitPosition - BitMath.mostSignificantBit(maskedWord) : bitPosition;
+                compressedNext = int256(compressedTick) - int256(uint256(stepBack));
+            } else {
+                // Mask all bits at or to the left of current position
+                uint256 bitMask = type(uint256).max << bitPosition;
+                uint256 maskedWord = word & bitMask;
+                initialized = maskedWord != 0;
+                // the least significant set bit, or the far (high) edge of the word when none is set
+                uint8 stepForward =
+                    initialized ? BitMath.leastSignificantBit(maskedWord) - bitPosition : type(uint8).max - bitPosition;
+                compressedNext = int256(compressedTick) + int256(uint256(stepForward));
+            }
+        }
+        // An initialized tick is always inside the domain. An empty word's far edge is not: with
+        // wide spacings the product overflows int24 (25599 * 32767 wrapped to -58367, a tick
+        // inside the domain that made the walk re-enter and re-quote liquidity it had already
+        // passed - external audit V4LE-140), so it is formed in int256 and clamped to the bound
+        // the search is heading for; the callers stop at that bound.
+        int256 tick = compressedNext * int256(tickSpacing);
+        if (tick < TickMath.MIN_TICK) tick = TickMath.MIN_TICK;
+        else if (tick > TickMath.MAX_TICK) tick = TickMath.MAX_TICK;
+        nextTick = int24(tick);
+    }
+
+    /// @notice Cross ticks during optimal swap calculation
+    /// @dev Simulates crossing initialized ticks until swap direction reverses or price target reached
+    /// @param params Parameters including pool, state, current price, and swap direction
+    function _traverseTicks(TraverseTicksParams memory params) private view {
+        int24 nextTick;
+        int16 wordPosition = type(int16).min;
+        uint256 tickBitmap;
+        do {
+            // Find next initialized tick
+            NextInitializedTickResult memory result = _locateNextTick(
+                NextInitializedTickParams({
+                    pool: params.pool,
+                    tickValue: params.state.tickValue,
+                    tickSpacing: params.state.tickSpacing,
+                    swapDir0to1: params.swapDir0to1,
+                    wordPosition: wordPosition,
+                    tickBitmap: tickBitmap
+                })
+            );
+            nextTick = result.nextTick;
+            wordPosition = result.wordPosition;
+            tickBitmap = result.tickBitmap;
+
+            if (nextTick < TickMath.MIN_TICK) {
+                nextTick = TickMath.MIN_TICK;
+            } else if (nextTick > TickMath.MAX_TICK) {
+                nextTick = TickMath.MAX_TICK;
+            }
+
+            uint160 sqrtPriceNext = TickMath.getSqrtPriceAtTick(nextTick);
+            uint256 amount0Target;
+            uint256 amount1Target;
+            unchecked {
+                if (!params.swapDir0to1) {
+                    // Swapping token1 -> token0
+                    uint256 inputAmount;
+                    uint256 feeAmt;
+                    (params.sqrtPrice, inputAmount, amount0Target, feeAmt) = SwapMath.computeSwapStep(
+                        uint160(params.state.sqrtPrice),
+                        sqrtPriceNext,
+                        params.state.liquidity,
+                        -int256(params.state.amount1Target),
+                        uint24(params.state.feeRate)
+                    );
+                    amount1Target = inputAmount + feeAmt; // Total amount consumed
+                    amount0Target = params.state.amount0Target + amount0Target;
+                    amount1Target = params.state.amount1Target - amount1Target;
+                } else {
+                    // Swapping token0 -> token1
+                    uint256 inputAmount;
+                    uint256 feeAmt;
+                    (params.sqrtPrice, inputAmount, amount1Target, feeAmt) = SwapMath.computeSwapStep(
+                        uint160(params.state.sqrtPrice),
+                        sqrtPriceNext,
+                        params.state.liquidity,
+                        -int256(params.state.amount0Target),
+                        uint24(params.state.feeRate)
+                    );
+                    amount0Target = inputAmount + feeAmt; // Total amount consumed
+                    amount0Target = params.state.amount0Target - amount0Target;
+                    amount1Target = params.state.amount1Target + amount1Target;
+                }
+            }
+            // Stop if we didn't reach the next tick or if direction reversed
+            if (params.sqrtPrice != sqrtPriceNext) break;
+            if (
+                _shouldSwap0to1(
+                        amount0Target, amount1Target, params.sqrtPrice, params.state.sqrtLower, params.state.sqrtUpper
+                    ) != params.swapDir0to1
+            ) {
+                break;
+            } else {
+                // Cross the tick and update liquidity
+                (, int128 netLiquidity) = params.pool.poolMgr.getTickLiquidity(params.pool.poolIdentifier, nextTick);
+                bool swapDir0to1 = params.swapDir0to1;
+                SwapState memory state = params.state;
+                uint160 sqrtPrice = params.sqrtPrice;
+                assembly ("memory-safe") {
+                    // Adjust liquidity net based on swap direction
+                    // If swapping left (zeroForOne), flip the sign of liquidityNet
+                    netLiquidity := add(swapDir0to1, xor(sub(0, swapDir0to1), netLiquidity))
+                    // Update state in memory
+                    mstore(state, add(mload(state), netLiquidity)) // liquidity
+                    mstore(add(state, 0x20), sqrtPrice) // sqrtPrice
+                    mstore(add(state, 0x40), sub(nextTick, swapDir0to1)) // tick
+                    mstore(add(state, 0x60), amount0Target) // amount0Target
+                    mstore(add(state, 0x80), amount1Target) // amount1Target
+                }
+                params.state = state;
+                params.sqrtPrice = sqrtPrice;
+            }
+        } while (true);
+    }
+
+    /// @notice Analytic solution for optimal swap (token0 -> token1)
+    /// @dev Solves quadratic equation: root = (sqrt(b^2 + 4ac) + b) / 2a
+    /// @param state Pool state at the last tick of optimal swap
+    /// @return sqrtPriceFinal Final sqrt price after optimal swap
+    function _calculateSwap0to1(SwapState memory state) private pure returns (uint160 sqrtPriceFinal) {
+        uint256 a;
+        uint256 b;
+        uint256 c;
+        uint256 sqrtPrice;
+        unchecked {
+            uint256 liquidity;
+            uint256 sqrtUpper;
+            uint256 feeRate;
+            uint256 FEE_DIFF;
+            assembly ("memory-safe") {
+                liquidity := mload(state)
+                sqrtPrice := mload(add(state, 0x20))
+                sqrtUpper := mload(add(state, 0xc0))
+                feeRate := mload(add(state, 0xe0))
+                FEE_DIFF := sub(MAX_FEE_PIPS, feeRate)
+            }
+            {
+                // Calculate coefficient 'a'
+                uint256 aBase;
+                assembly ("memory-safe") {
+                    let amount0Target := mload(add(state, 0x60))
+                    let liqX96 := shl(96, liquidity)
+                    // a = amount0Target + liquidity / ((1 - f) * sqrtPrice) - liquidity / sqrtUpper
+                    aBase := add(amount0Target, div(mul(MAX_FEE_PIPS, liqX96), mul(FEE_DIFF, sqrtPrice)))
+                    a := sub(aBase, div(liqX96, sqrtUpper))
+                    // a < amount0Target means sqrtUpper < (1 - f) * sqrtPrice: not an in-range
+                    // state, the solver's premise is broken
+                    if lt(a, amount0Target) {
+                        mstore(0, 0x20236808) // Math_Overflow error selector
+                        revert(0x1c, 0x04)
+                    }
+                }
+                // a == amount0Target is the exact upper bound of a zero-fee pool (external audit
+                // V4LE-85), a valid state the old strict guard rejected. With token0 to place the
+                // quadratic is well-defined there (leading coefficient amount0Target) and finds the
+                // interior root; with none it degenerates to the linear solution p == sqrtPrice, i.e.
+                // no swap - return it directly, the division by a below would yield 0.
+                if (a == 0) {
+                    return uint160(sqrtPrice);
+                }
+                // Calculate coefficient 'b'
+                b = FullMath.mulDiv(aBase, state.sqrtLower, FixedPoint96.Q96);
+                assembly {
+                    b := add(div(mul(feeRate, liquidity), FEE_DIFF), b)
+                }
+            }
+            {
+                // Calculate coefficient 'c'
+                uint256 cBase = FullMath.mulDiv(liquidity, sqrtPrice, FixedPoint96.Q96);
+                assembly ("memory-safe") {
+                    cBase := add(mload(add(state, 0x80)), cBase)
+                }
+                c = cBase - FullMath.mulDiv(liquidity, (MAX_FEE_PIPS * state.sqrtLower) / FEE_DIFF, FixedPoint96.Q96);
+                // NOTE (M-5): 'c' is intentionally not guarded with `c > amount1Target`. Unlike the 'a'
+                // guard above - whose invariant (sqrtUpper > (1-f)*sqrtPrice) always holds for a valid
+                // in-range state and so only catches corruption - `c > amount1Target` does NOT always hold:
+                // when sqrtPrice is within the fee band of sqrtLower, c is legitimately a small value below
+                // amount1Target. Guarding it reverts valid tight-range swaps (breaks
+                // test_LiquidityCalculator_NarrowRange). On the rare extreme where the subtraction wraps, the
+                // result degrades to the clamped boundary price (a minimal/no-op swap), and downstream
+                // amountOutMin / oracle slippage checks bound any mispricing - so a hard revert is worse.
+                b -= cBase.mulDiv(FixedPoint96.Q96, sqrtUpper);
+            }
+            // Multiply a and c by 2 for quadratic formula
+            assembly {
+                a := shl(1, a)
+                c := shl(1, c)
+            }
+        }
+        // The root lies in [sqrtLower, sqrtPrice]: the direction check that selected this solver
+        // holds token0 in surplus at sqrtPrice and the range wants only token0 at sqrtLower.
+        uint256 root = _positiveQuadraticRoot(a, b, c, sqrtPrice);
+        if (root > sqrtPrice) root = sqrtPrice;
+        if (root < state.sqrtLower) root = state.sqrtLower;
+        sqrtPriceFinal = uint160(root);
+    }
+
+    /// @notice Analytic solution for optimal swap (token1 -> token0)
+    /// @dev Solves quadratic equation: root = (sqrt(b^2 + 4ac) + b) / 2a
+    /// @param state Pool state at the last tick of optimal swap
+    /// @return sqrtPriceFinal Final sqrt price after optimal swap
+    function _calculateSwap1to0(SwapState memory state) private pure returns (uint160 sqrtPriceFinal) {
+        uint256 a;
+        uint256 b;
+        uint256 c;
+        uint256 sqrtPrice;
+        unchecked {
+            uint256 liquidity;
+            uint256 sqrtUpper;
+            uint256 feeRate;
+            uint256 FEE_DIFF;
+            assembly ("memory-safe") {
+                liquidity := mload(state)
+                sqrtPrice := mload(add(state, 0x20))
+                sqrtUpper := mload(add(state, 0xc0))
+                feeRate := mload(add(state, 0xe0))
+                FEE_DIFF := sub(MAX_FEE_PIPS, feeRate)
+            }
+            {
+                // Calculate coefficient 'a'
+                uint256 aBase;
+                // NOTE (M-5): 'a' is intentionally not guarded with `a > amount0Target`. Unlike the 'c'
+                // guard below - whose invariant (sqrtPrice > (1-f)*sqrtLower) always holds for a valid
+                // in-range state and so only catches corruption - `a > amount0Target` does NOT always hold:
+                // when sqrtPrice is within the fee band of sqrtUpper, a is legitimately a small value below
+                // amount0Target. Guarding it reverts valid tight-range swaps (breaks
+                // test_LiquidityCalculator_NarrowRange). On the rare extreme where the subtraction wraps, the
+                // result degrades to the clamped boundary price (a minimal/no-op swap), and downstream
+                // amountOutMin / oracle slippage checks bound any mispricing - so a hard revert is worse.
+                assembly ("memory-safe") {
+                    let liqX96 := shl(96, liquidity)
+                    // a = amount0Target + liquidity / sqrtPrice - liquidity / ((1 - f) * sqrtUpper)
+                    aBase := add(mload(add(state, 0x60)), div(liqX96, sqrtPrice))
+                    a := sub(aBase, div(mul(MAX_FEE_PIPS, liqX96), mul(FEE_DIFF, sqrtUpper)))
+                }
+                // Calculate coefficient 'b'
+                b = FullMath.mulDiv(aBase, state.sqrtLower, FixedPoint96.Q96);
+                assembly {
+                    b := sub(b, div(mul(feeRate, liquidity), FEE_DIFF))
+                }
+            }
+            {
+                // Calculate coefficient 'c'
+                uint256 cBase = FullMath.mulDiv(liquidity, (MAX_FEE_PIPS * sqrtPrice) / FEE_DIFF, FixedPoint96.Q96);
+                uint256 amount1Target;
+                assembly ("memory-safe") {
+                    amount1Target := mload(add(state, 0x80))
+                    cBase := add(amount1Target, cBase)
+                }
+                c = cBase - FullMath.mulDiv(liquidity, state.sqrtLower, FixedPoint96.Q96);
+                // c < amount1Target means sqrtPrice < (1 - f) * sqrtLower: not an in-range state,
+                // the solver's premise is broken
+                assembly ("memory-safe") {
+                    if lt(c, amount1Target) {
+                        mstore(0, 0x20236808) // Math_Overflow error selector
+                        revert(0x1c, 0x04)
+                    }
+                }
+                // c == amount1Target is the exact lower bound of a zero-fee pool (external audit
+                // V4LE-85), a valid state the old strict guard rejected. With token1 to place the
+                // quadratic finds the interior root; with none the root is p == sqrtPrice, i.e. no
+                // swap - return it directly rather than rely on the rounding of the general path.
+                if (c == 0) {
+                    return uint160(sqrtPrice);
+                }
+                b -= cBase.mulDiv(FixedPoint96.Q96, sqrtUpper);
+            }
+            // Multiply a and c by 2 for quadratic formula
+            assembly {
+                a := shl(1, a)
+                c := shl(1, c)
+            }
+        }
+        // The root lies in [sqrtPrice, sqrtUpper]: the direction check that selected this solver
+        // holds token1 in surplus at sqrtPrice and the range wants only token1 at sqrtUpper.
+        uint256 root = _positiveQuadraticRoot(a, b, c, sqrtPrice);
+        if (root < sqrtPrice) root = sqrtPrice;
+        if (root > state.sqrtUpper) root = state.sqrtUpper;
+        sqrtPriceFinal = uint160(root);
+    }
+
+    /// @notice The analytic solvers' root of a*p^2 - b*p - c == 0: p = (b + sqrt(b^2 + 4ac)) / (2a)
+    /// @dev The coefficients are two's-complement words (see _sqrtDiscriminant), `a2` and `c2`
+    ///      already doubled. Formed the numerically stable way: with b >= 0 the sum b + sqrt(D)
+    ///      is exact, with b < 0 the same root is 2c / (sqrt(D) - b), whose denominator is again a
+    ///      sum of magnitudes. The textbook form b + sqrt(D) cancels there (sqrt(D) is floored, so
+    ///      for a*c << b^2 the numerator is off by whole units and the division by a small `a`
+    ///      turns that into an arbitrary price), and at a == 0 - a valid fee-bearing state of the
+    ///      1->0 solver, where the balance equation is linear with root

@@ -1,0 +1,655 @@
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity ^0.8.0;
+
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
+import {Actions} from "@uniswap/v4-periphery/src/libraries/Actions.sol";
+import {IWETH9} from "@uniswap/v4-periphery/src/interfaces/external/IWETH9.sol";
+
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import {ERC20, IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {SafeERC20, IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
+import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {Multicall} from "@openzeppelin/contracts/utils/Multicall.sol";
+import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
+
+import {V4VaultPositionActions} from "./V4VaultPositionActions.sol";
+import {LiquidationEscrow} from "./LiquidationEscrow.sol";
+import {IVault} from "./interfaces/IVault.sol";
+import {IRemintMigrationHook} from "./interfaces/IRemintMigrationHook.sol";
+import {IV4Oracle} from "../oracle/interfaces/IV4Oracle.sol";
+import {IInterestRateModel} from "./interfaces/IInterestRateModel.sol";
+import {Constants} from "../shared/Constants.sol";
+
+/// @title Revert Lend Vault for token lending / borrowing using Uniswap V4 LP positions as collateral
+/// @notice The vault manages ONE ERC20 (eg. USDC) asset for lending / borrowing, but collateral positions can be composed of any 2 tokens configured each with a collateralFactor > 0
+/// @dev Vault implements IERC4626 Vault Standard and is itself an ERC20 which represents shares of the total lending pool
+/// @custom:security Trust Assumptions:
+///   - Owner is trusted to configure valid token collateral factors and transformers
+///   - Oracle is trusted to provide accurate position valuations
+///   - Transformers are whitelisted and audited contracts that can modify positions atomically
+///   - Interest rate model is trusted for rate calculations
+/// @custom:security Reentrancy:
+///   - transform() is protected by transformedTokenId state variable acting as a reentrancy guard
+///   - liquidate() and borrow() check transformedTokenId to prevent reentrancy
+/// @custom:security Oracle Manipulation:
+///   - Position values depend on V4Oracle which validates pool prices against Chainlink feeds
+///   - Price manipulation attacks are mitigated by maxPoolPriceDifference check
+contract V4Vault is ERC20, Multicall, Ownable2Step, IVault, IERC721Receiver, Constants {
+    using Math for uint256;
+
+    // forge-lint: disable-next-line(unsafe-typecast)
+    uint32 public constant MAX_COLLATERAL_FACTOR_X32 = uint32(Q32 * 90 / 100); // 90%
+
+    // forge-lint: disable-next-line(unsafe-typecast)
+    uint32 public constant MIN_LIQUIDATION_PENALTY_X32 = uint32(Q32 * 2 / 100); // 2%
+    // forge-lint: disable-next-line(unsafe-typecast)
+    uint32 public constant MAX_LIQUIDATION_PENALTY_X32 = uint32(Q32 * 10 / 100); // 10%
+
+    // forge-lint: disable-next-line(unsafe-typecast)
+    uint32 public constant MIN_RESERVE_PROTECTION_FACTOR_X32 = uint32(Q32 / 100); //1%
+
+    // forge-lint: disable-next-line(unsafe-typecast)
+    uint32 public constant MAX_RESERVE_PROTECTION_FACTOR_X32 = uint32(Q32 / 2); //50%
+
+    // forge-lint: disable-next-line(unsafe-typecast)
+    uint32 public constant MAX_RESERVE_FACTOR_X32 = uint32(Q32 / 2); //50%
+
+    // forge-lint: disable-next-line(unsafe-typecast)
+    uint32 public constant MAX_DAILY_LEND_INCREASE_X32 = uint32(Q32 / 10); //10%
+    // forge-lint: disable-next-line(unsafe-typecast)
+    uint32 public constant MAX_DAILY_DEBT_INCREASE_X32 = uint32(Q32 / 10); //10%
+
+    /// @notice Uniswap v4 position manager
+    IPositionManager public immutable positionManager;
+
+    /// @notice Uniswap v4 pool manager
+    IPoolManager public immutable poolManager;
+
+    /// @notice interest rate model implementation
+    IInterestRateModel public immutable interestRateModel;
+
+    LiquidationEscrow public immutable liquidationEscrow;
+    V4VaultPositionActions private immutable positionActions;
+
+    /// @notice oracle implementation
+    IV4Oracle public immutable oracle;
+
+    /// @notice wrapped native token address
+    IWETH9 public immutable weth;
+
+    /// @notice underlying asset for lending / borrowing
+    address public immutable override asset;
+
+    /// @notice decimals of underlying token (are the same as ERC20 share token)
+    uint8 private immutable assetDecimals;
+
+    // events
+    event ApprovedTransform(uint256 indexed tokenId, address owner, address target, bool isActive);
+
+    event Add(uint256 indexed tokenId, address owner, uint256 oldTokenId); // when a token is added replacing another token - oldTokenId > 0
+    event Remove(uint256 indexed tokenId, address owner, address recipient);
+    event Transfer(uint256 indexed tokenId, address from, address to);
+
+    event ExchangeRateUpdate(uint256 debtExchangeRateX96, uint256 lendExchangeRateX96);
+    // Deposit and Withdraw events are defined in IERC4626
+    event WithdrawCollateral(
+        uint256 indexed tokenId, address owner, address recipient, uint128 liquidity, uint256 amount0, uint256 amount1
+    );
+    event Borrow(uint256 indexed tokenId, address owner, uint256 assets, uint256 shares);
+    event Repay(uint256 indexed tokenId, address repayer, address owner, uint256 assets, uint256 shares);
+    event Liquidate(
+        uint256 indexed tokenId,
+        address liquidator,
+        address owner,
+        uint256 value,
+        uint256 cost,
+        uint256 amount0,
+        uint256 amount1,
+        uint256 reserve,
+        uint256 missing
+    ); // shows exactly how liquidation amounts were divided
+
+    // admin events
+    event WithdrawReserves(uint256 amount, address receiver);
+    event SetTransformer(address transformer, bool active);
+    event SetLimits(
+        uint256 minLoanSize,
+        uint256 globalLendLimit,
+        uint256 globalDebtLimit,
+        uint256 dailyLendIncreaseLimitMin,
+        uint256 dailyDebtIncreaseLimitMin
+    );
+    event SetReserveFactor(uint32 reserveFactorX32);
+    event SetReserveProtectionFactor(uint32 reserveProtectionFactorX32);
+    event SetTokenConfig(address token, uint32 collateralFactorX32, uint32 collateralValueLimitFactorX32);
+
+    event SetEmergencyAdmin(address emergencyAdmin);
+    event SetHookAllowList(address hook, bool isAllowed);
+
+    // configured tokens
+    struct TokenConfig {
+        uint32 collateralFactorX32; // how much this token is valued as collateral
+        uint32 collateralValueLimitFactorX32; // how much asset equivalent may be lent out given this collateral
+        uint192 totalDebtShares; // how much debt shares are theoretically backed by this collateral
+    }
+
+    mapping(address => TokenConfig) public tokenConfigs;
+
+    // hooks which are allowed in positions
+    mapping(address => bool) public hookAllowList;
+
+    // total of debt shares - increases when borrow - decreases when repay
+    uint256 public debtSharesTotal;
+
+    // exchange rates are Q96 at the beginning - 1 share token per 1 asset token
+    uint256 public lastDebtExchangeRateX96 = Q96;
+    uint256 public lastLendExchangeRateX96 = Q96;
+
+    uint256 public globalDebtLimit;
+
+    /// @notice Optional absolute token debt budget in asset units; zero uses the governance global
+    /// debt limit multiplied by the token concentration factor. Neither bound depends on deposits.
+    mapping(address token => uint256) public tokenDebtLimits;
+    event SetTokenDebtLimit(address indexed token, uint256 limit);
+
+    function setTokenDebtLimit(address token, uint256 limit) external onlyOwner {
+        tokenDebtLimits[token] = limit;
+        emit SetTokenDebtLimit(token, limit);
+    }
+    uint256 public globalLendLimit;
+
+    // minimal size of loan (to protect from non-liquidatable positions because of gas-cost)
+    uint256 public minLoanSize;
+
+    // daily lend increase limit handling
+    uint256 public dailyLendIncreaseLimitMin;
+    uint256 public dailyLendIncreaseLimitLeft;
+
+    /// @notice Net lender inflow (deposits minus withdrawals, floored at zero) since the last daily lend
+    ///         reset. Every supply-relative bound (the per-token debt concentration cap and the daily
+    ///         debt quota) is sized on the lender supply net of the part of this amount that exceeds
+    ///         `dailyLendIncreaseLimitMin`, so beyond the governance bootstrap allowance a deposit only
+    ///         widens those bounds from the next UTC day on. A same-day deposit-borrow-withdraw sequence
+    ///         therefore cannot inflate the supply the bounds are measured against (V4LE-122, V4LE-127).
+    uint256 public dailyLendNetInflow;
+
+    // daily debt increase limit handling
+    uint256 public dailyDebtIncreaseLimitMin;
+    uint256 public dailyDebtIncreaseLimitLeft;
+
+    // lender balances are handled with ERC-20 mint/burn
+
+    // loans are handled with this struct
+    struct Loan {
+        uint256 debtShares;
+    }
+
+    mapping(uint256 => Loan) public override loans; // tokenID -> loan mapping
+
+    // storage variables to handle enumerable token ownership
+    mapping(address => uint256[]) private ownedTokens; // Mapping from owner address to list of owned token IDs
+    mapping(uint256 => uint256) private ownedTokensIndex; // Mapping from token ID to index of the owner tokens list (for removal without loop)
+    mapping(uint256 => address) private tokenOwner; // Mapping from token ID to owner
+
+    uint256 public override transformedTokenId; // stores currently transformed token (is always reset to 0 after tx)
+
+    /// @dev Transient slot holding the token id a running transform started with. A remint moves
+    ///      transformedTokenId to the replacement, so the hook's migration entry needs the origin to
+    ///      bind the retired token it is asked to migrate from to this very transform.
+    bytes32 internal constant _TRANSFORM_ORIGIN_SLOT = keccak256("V4Vault.transformOriginTokenId");
+    uint256 private liquidatingTokenId; // stores currently liquidated token during collateral payout callbacks
+
+    mapping(address => bool) public transformerAllowList; // contracts allowed to transform positions (selected audited contracts e.g. V4Utils)
+    mapping(address => mapping(uint256 => mapping(address => bool))) public transformApprovals; // owners permissions for other addresses to call transform on owners behalf (e.g. AutoRange contract)
+
+    // last time exchange rate was updated
+    uint64 public lastExchangeRateUpdate;
+
+    // percentage of interest which is kept in the protocol for reserves
+    uint32 public reserveFactorX32;
+
+    // percentage of lend amount which needs to be in reserves before withdrawn
+    uint32 public reserveProtectionFactorX32 = MIN_RESERVE_PROTECTION_FACTOR_X32;
+
+    // when limits where last reset
+    uint32 public dailyLendIncreaseLimitLastReset;
+    uint32 public dailyDebtIncreaseLimitLastReset;
+
+    // address which can call special emergency actions without timelock
+    address public emergencyAdmin;
+
+    constructor(
+        string memory name,
+        string memory symbol,
+        address _asset,
+        IPositionManager _positionManager,
+        IInterestRateModel _interestRateModel,
+        IV4Oracle _oracle,
+        IWETH9 _weth
+    ) ERC20(name, symbol) Ownable(msg.sender) {
+        liquidationEscrow = new LiquidationEscrow();
+        positionActions = new V4VaultPositionActions(_positionManager);
+        asset = _asset;
+        assetDecimals = IERC20Metadata(_asset).decimals();
+        positionManager = _positionManager;
+        poolManager = IPoolManager(_positionManager.poolManager());
+        interestRateModel = _interestRateModel;
+        oracle = _oracle;
+        weth = _weth;
+    }
+
+    ////////////////// EXTERNAL VIEW FUNCTIONS
+
+    /// @notice Retrieves global information about the vault
+    /// @return debt Total amount of debt asset tokens
+    /// @return lent Total amount of lent asset tokens
+    /// @return balance Balance of asset token in contract
+    /// @return reserves Amount of reserves
+    function vaultInfo()
+        external
+        view
+        override
+        returns (
+            uint256 debt,
+            uint256 lent,
+            uint256 balance,
+            uint256 reserves,
+            uint256 debtExchangeRateX96,
+            uint256 lendExchangeRateX96
+        )
+    {
+        (debtExchangeRateX96, lendExchangeRateX96) = _calculateGlobalInterest();
+        (balance, reserves) = _getBalanceAndReserves(debtExchangeRateX96, lendExchangeRateX96);
+
+        debt = _convertToAssets(debtSharesTotal, debtExchangeRateX96, Math.Rounding.Ceil);
+        lent = _convertToAssets(totalSupply(), lendExchangeRateX96, Math.Rounding.Floor);
+    }
+
+    /// @notice Retrieves lending information for a specified account.
+    /// @param account The address of the account for which lending info is requested.
+    /// @return amount Amount of lent assets for the account
+    function lendInfo(address account) external view override returns (uint256 amount) {
+        (, uint256 newLendExchangeRateX96) = _calculateGlobalInterest();
+        amount = _convertToAssets(balanceOf(account), newLendExchangeRateX96, Math.Rounding.Floor);
+    }
+
+    /// @notice Retrieves details of a loan identified by its token ID.
+    /// @param tokenId The unique identifier of the loan - which is the corresponding UniV4 Position
+    /// @return debt Amount of debt for this position
+    /// @return fullValue Current value of the position priced as asset token
+    /// @return collateralValue Current collateral value of the position priced as asset token
+    /// @return liquidationCost If position is liquidatable - cost to liquidate position - otherwise 0
+    /// @return liquidationValue If position is liquidatable - the value of the (partial) position which the liquidator recieves - otherwise 0
+    /// @dev Requires Oracle support for both position tokens and the vault asset token.
+    ///      If a required token feed is missing, oracle.getValue() reverts with NotConfigured().
+    function loanInfo(uint256 tokenId)
+        external
+        view
+        override
+        returns (
+            uint256 debt,
+            uint256 fullValue,
+            uint256 collateralValue,
+            uint256 liquidationCost,
+            uint256 liquidationValue
+        )
+    {
+        (uint256 newDebtExchangeRateX96,) = _calculateGlobalInterest();
+
+        debt = _convertToAssets(loans[tokenId].debtShares, newDebtExchangeRateX96, Math.Rounding.Ceil);
+
+        bool isHealthy;
+        (isHealthy, fullValue, collateralValue,,,) = _checkLoanIsHealthy(tokenId, debt);
+
+        if (!isHealthy) {
+            (liquidationValue, liquidationCost,) = _calculateLiquidation(debt, fullValue, collateralValue);
+        }
+    }
+
+    /// @notice Retrieves owner of a loan
+    /// @param tokenId The unique identifier of the loan - which is the corresponding UniV4 Position
+    /// @return owner Owner of the loan
+    function ownerOf(uint256 tokenId) external view override returns (address owner) {
+        return tokenOwner[tokenId];
+    }
+
+    /// @notice Retrieves count of loans for owner (for enumerating owners loans)
+    /// @param owner Owner address
+    function loanCount(address owner) external view override returns (uint256) {
+        return ownedTokens[owner].length;
+    }
+
+    /// @notice Retrieves tokenid of loan at given index for owner (for enumerating owners loans)
+    /// @param owner Owner address
+    /// @param index Index
+    function loanAtIndex(address owner, uint256 index) external view override returns (uint256) {
+        return ownedTokens[owner][index];
+    }
+
+    ////////////////// OVERRIDDEN EXTERNAL VIEW FUNCTIONS FROM ERC20
+    /// @inheritdoc IERC20Metadata
+    function decimals() public view override(IERC20Metadata, ERC20) returns (uint8) {
+        return assetDecimals;
+    }
+
+    ////////////////// OVERRIDDEN EXTERNAL VIEW FUNCTIONS FROM ERC4626
+
+    /// @inheritdoc IERC4626
+    function totalAssets() public view override returns (uint256) {
+        (, uint256 lendExchangeRateX96) = _calculateGlobalInterest();
+        return _convertToAssets(totalSupply(), lendExchangeRateX96, Math.Rounding.Floor);
+    }
+
+    /// @inheritdoc IERC4626
+    function convertToShares(uint256 assets) external view override returns (uint256 shares) {
+        (, uint256 lendExchangeRateX96) = _calculateGlobalInterest();
+        return _convertToShares(assets, lendExchangeRateX96, Math.Rounding.Floor);
+    }
+
+    /// @inheritdoc IERC4626
+    function convertToAssets(uint256 shares) external view override returns (uint256 assets) {
+        (, uint256 lendExchangeRateX96) = _calculateGlobalInterest();
+        return _convertToAssets(shares, lendExchangeRateX96, Math.Rounding.Floor);
+    }
+
+    /// @inheritdoc IERC4626
+    function maxDeposit(address) external view override returns (uint256) {
+        (, uint256 lendExchangeRateX96) = _calculateGlobalInterest();
+        if (lendExchangeRateX96 == 0) {
+            return 0;
+        }
+        uint256 value = _convertToAssets(totalSupply(), lendExchangeRateX96, Math.Rounding.Ceil);
+        if (value >= globalLendLimit) {
+            return 0;
+        } else {
+            uint256 maxGlobalDeposit = globalLendLimit - value;
+            if (maxGlobalDeposit > dailyLendIncreaseLimitLeft) {
+                return dailyLendIncreaseLimitLeft;
+            } else {
+                return maxGlobalDeposit;
+            }
+        }
+    }
+
+    /// @inheritdoc IERC4626
+    function maxMint(address) external view override returns (uint256) {
+        (, uint256 lendExchangeRateX96) = _calculateGlobalInterest();
+        if (lendExchangeRateX96 == 0) {
+            return 0;
+        }
+        uint256 value = _convertToAssets(totalSupply(), lendExchangeRateX96, Math.Rounding.Ceil);
+        if (value >= globalLendLimit) {
+            return 0;
+        } else {
+            uint256 maxGlobalDeposit = globalLendLimit - value;
+            if (maxGlobalDeposit > dailyLendIncreaseLimitLeft) {
+                return _convertToShares(dailyLendIncreaseLimitLeft, lendExchangeRateX96, Math.Rounding.Floor);
+            } else {
+                return _convertToShares(maxGlobalDeposit, lendExchangeRateX96, Math.Rounding.Floor);
+            }
+        }
+    }
+
+    /// @inheritdoc IERC4626
+    function maxWithdraw(address owner) external view override returns (uint256) {
+        (uint256 debtExchangeRateX96, uint256 lendExchangeRateX96) = _calculateGlobalInterest();
+
+        uint256 ownerShareBalance = balanceOf(owner);
+        uint256 ownerAssetBalance = _convertToAssets(ownerShareBalance, lendExchangeRateX96, Math.Rounding.Floor);
+
+        (uint256 balance,) = _getBalanceAndReserves(debtExchangeRateX96, lendExchangeRateX96);
+        if (balance > ownerAssetBalance) {
+            return ownerAssetBalance;
+        } else {
+            return balance;
+        }
+    }
+
+    /// @inheritdoc IERC4626
+    function maxRedeem(address owner) external view override returns (uint256) {
+        (uint256 debtExchangeRateX96, uint256 lendExchangeRateX96) = _calculateGlobalInterest();
+        if (lendExchangeRateX96 == 0) {
+            return 0;
+        }
+
+        uint256 ownerShareBalance = balanceOf(owner);
+
+        (uint256 balance,) = _getBalanceAndReserves(debtExchangeRateX96, lendExchangeRateX96);
+        uint256 shareBalance = _convertToShares(balance, lendExchangeRateX96, Math.Rounding.Floor);
+
+        if (shareBalance > ownerShareBalance) {
+            return ownerShareBalance;
+        } else {
+            return shareBalance;
+        }
+    }
+
+    /// @inheritdoc IERC4626
+    function previewDeposit(uint256 assets) public view override returns (uint256) {
+        (, uint256 lendExchangeRateX96) = _calculateGlobalInterest();
+        return _convertToShares(assets, lendExchangeRateX96, Math.Rounding.Floor);
+    }
+
+    /// @inheritdoc IERC4626
+    function previewMint(uint256 shares) public view override returns (uint256) {
+        (, uint256 lendExchangeRateX96) = _calculateGlobalInterest();
+        if (shares > 0 && lendExchangeRateX96 == 0) {
+            revert InvalidConfig();
+        }
+        return _convertToAssets(shares, lendExchangeRateX96, Math.Rounding.Ceil);
+    }
+
+    /// @inheritdoc IERC4626
+    function previewWithdraw(uint256 assets) public view override returns (uint256) {
+        (, uint256 lendExchangeRateX96) = _calculateGlobalInterest();
+        return _convertToShares(assets, lendExchangeRateX96, Math.Rounding.Ceil);
+    }
+
+    /// @inheritdoc IERC4626
+    function previewRedeem(uint256 shares) public view override returns (uint256) {
+        (, uint256 lendExchangeRateX96) = _calculateGlobalInterest();
+        return _convertToAssets(shares, lendExchangeRateX96, Math.Rounding.Floor);
+    }
+
+    ////////////////// OVERRIDDEN EXTERNAL FUNCTIONS FROM ERC4626
+
+    /// @inheritdoc IERC4626
+    function deposit(uint256 assets, address receiver) external override returns (uint256) {
+        (, uint256 shares) = _deposit(receiver, assets, false);
+        return shares;
+    }
+
+    /// @inheritdoc IERC4626
+    function mint(uint256 shares, address receiver) external override returns (uint256) {
+        (uint256 assets,) = _deposit(receiver, shares, true);
+        return assets;
+    }
+
+    /// @inheritdoc IERC4626
+    function withdraw(uint256 assets, address receiver, address owner) external override returns (uint256) {
+        (, uint256 shares) = _withdraw(receiver, owner, assets, false);
+        return shares;
+    }
+
+    /// @inheritdoc IERC4626
+    function redeem(uint256 shares, address receiver, address owner) external override returns (uint256) {
+        (uint256 assets,) = _withdraw(receiver, owner, shares, true);
+        return assets;
+    }
+
+    ////////////////// EXTERNAL FUNCTIONS
+
+    /// @notice Creates a new collateralized position by transferring an approved Uniswap V4 position NFT
+    /// @dev The position NFT must be approved for this contract. The recipient becomes the loan owner.
+    /// @param tokenId The token ID of the Uniswap V4 position NFT to use as collateral
+    /// @param recipient Address to receive ownership of the position/loan in the vault
+    /// @custom:security The hook attached to the position (address(0) for non-hooked positions) must be in
+    /// hookAllowList. Non-hooked positions are only accepted if address(0) has been explicitly allowlisted.
+    function create(uint256 tokenId, address recipient) external override {
+        if (recipient == address(0)) {
+            revert InvalidConfig();
+        }
+        IERC721(address(positionManager)).safeTransferFrom(msg.sender, address(this), tokenId, abi.encode(recipient));
+    }
+
+    /// @notice Handles special case when a token is received by the vault from a hook contract during transform
+    /// @dev Can only be called by whitelisted transformers while in transform mode. Used when hooks create new positions.
+    /// @param tokenId The token ID of the newly received position NFT
+    /// @param recipient Address to receive ownership of the position/loan
+    /// @custom:security Only callable from transformer contracts during active transform to prevent unauthorized position injection
+    function notifyERC721Received(uint256 tokenId, address recipient) external override {
+        // must be called from a transformer contract, be in transform mode and the token must not be owned by anyone else
+        if (!transformerAllowList[msg.sender] || transformedTokenId == 0 || tokenOwner[tokenId] != address(0)) {
+            revert Unauthorized();
+        }
+
+        // the vault must actually hold the NFT - prevents registering a loan for a position not in custody
+        if (IERC721(address(positionManager)).ownerOf(tokenId) != address(this)) {
+            revert Unauthorized();
+        }
+
+        _handleErc721Received(tokenId, recipient);
+    }
+
+    /// @notice Whenever a token is recieved it either creates a new loan, or modifies an existing one when in transform mode.
+    /// @inheritdoc IERC721Receiver
+    function onERC721Received(
+        address,
+        /*operator*/
+        address from,
+        uint256 tokenId,
+        bytes calldata data
+    )
+        external
+        override
+        returns (bytes4)
+    {
+        // only Uniswap v4 NFTs allowed - sent from other contract
+        if (msg.sender != address(positionManager) || from == address(this)) {
+            revert WrongContract();
+        }
+
+        address owner = from;
+        if (data.length > 0) {
+            owner = abi.decode(data, (address));
+        }
+
+        _handleErc721Received(tokenId, owner);
+
+        return IERC721Receiver.onERC721Received.selector;
+    }
+
+    /// @notice Internal function to handle ERC721 token receipt logic
+    /// @param tokenId The token ID received
+    /// @param owner The owner address for the new loan
+    function _handleErc721Received(uint256 tokenId, address owner) internal {
+        if (owner == address(0)) {
+            revert InvalidConfig();
+        }
+
+        (uint256 debtExchangeRateX96, uint256 lendExchangeRateX96) = _updateGlobalInterest();
+
+        uint256 oldTokenId = transformedTokenId;
+
+        if (oldTokenId == 0) {
+            loans[tokenId] = Loan(0);
+
+            _checkHookAllowed(tokenId);
+            _addTokenToOwner(owner, tokenId);
+            emit Add(tokenId, owner, 0);
+        } else {
+            // if in transform mode - and a new position is sent - current position is replaced and returned
+            if (tokenId != oldTokenId) {
+                address owner_ = tokenOwner[oldTokenId];
+
+                // set transformed token to new one
+                transformedTokenId = tokenId;
+
+                uint256 debtShares = loans[oldTokenId].debtShares;
+
+                // copy debt to new token
+                loans[tokenId] = Loan(debtShares);
+
+                _checkHookAllowed(tokenId);
+                _addTokenToOwner(owner_, tokenId);
+                emit Add(tokenId, owner_, oldTokenId);
+
+                // remove debt from old loan
+                _cleanupLoan(oldTokenId, debtExchangeRateX96, lendExchangeRateX96);
+
+                // sets data of new loan
+                _updateAndCheckCollateral(tokenId, debtExchangeRateX96, lendExchangeRateX96, 0, debtShares);
+            }
+        }
+    }
+
+    /// @notice Allows another address to call transform on behalf of owner (on a given token)
+    /// @dev Approvals are keyed per (owner, tokenId, target) and are NOT cleared by remove(): if the
+    /// same owner re-deposits the same tokenId later, previously granted approvals are active again.
+    /// Approvals are also copied to the replacement tokenId when a transform remints the position.
+    /// Owners who want to revoke access must call this with isActive = false per target.
+    /// @param tokenId The token to be permitted
+    /// @param target The address to be allowed
+    /// @param isActive If it allowed or not
+    function approveTransform(uint256 tokenId, address target, bool isActive) external override {
+        if (tokenOwner[tokenId] != msg.sender) {
+            revert Unauthorized();
+        }
+        transformApprovals[msg.sender][tokenId][target] = isActive;
+
+        emit ApprovedTransform(tokenId, msg.sender, target, isActive);
+    }
+
+    /// @notice Transfers ownership of a loan to a new owner
+    /// @dev Transform approvals are keyed by owner, so the former owner's approvals stop working with the
+    ///      transfer. The one for the position's own (allowlisted) pool hook is moved to the new owner: the
+    ///      hook's automation is keyed by token id and stays armed across the transfer, and without the
+    ///      approval every hook transform would fail and consume the trigger while the position looked
+    ///      protected. The new owner can revoke it with approveTransform. Approvals for other targets
+    ///      (operators of the former owner) are not carried; they cannot be enumerated and are not
+    ///      bound to the position.
+    /// @param tokenId The token ID of the loan to transfer
+    /// @param newOwner The address of the new owner
+    function transferLoan(uint256 tokenId, address newOwner) external override {
+        _checkNotLiquidating(tokenId);
+
+        // transferLoan is not allowed during transformer mode
+        if (transformedTokenId != 0) {
+            revert TransformNotAllowed();
+        }
+
+        address currentOwner = tokenOwner[tokenId];
+        if (currentOwner != msg.sender) {
+            revert Unauthorized();
+        }
+        if (newOwner == address(0)) {
+            revert Unauthorized();
+        }
+        // the vault itself can never act as a loan owner - the loan would be stranded
+        if (newOwner == address(this)) {
+            revert SelfSend();
+        }
+
+        _removeTokenFromOwner(currentOwner, tokenId);
+        _addTokenToOwner(newOwner, tokenId);
+
+        (PoolKey memory poolKey,) = positionManager.getPoolAndPositionInfo(tokenId);
+        address hook = address(poolKey.hooks);
+        if (hook != address(0) && hookAllowList[hook] && transformApprovals[currentOwner][tokenId][hook]) {
+            transformApprovals[currentOwner][tokenId][hook] = false;
+            transformApprovals[newOwner][tokenId][hook] = true;
+            emit ApprovedTransform(tokenId, currentOwner, hook, false);
+            emit ApprovedTransform(tokenId, newOwner, hook, true);
+        }
+
+        emit Transfer(tokenId, currentOwner, newOwner);
+    }
+
+    /// @notice Allows a whitelisted transformer contract to atomically modify a loan position
+    /// @dev The transformer

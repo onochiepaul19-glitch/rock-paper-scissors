@@ -1,0 +1,634 @@
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity ^0.8.30;
+
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {PositionInfo} from "@uniswap/v4-periphery/src/libraries/PositionInfoLibrary.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+
+import {TickLinkedList} from "./lib/TickLinkedList.sol";
+import {PositionModeFlags} from "./lib/PositionModeFlags.sol";
+import {RevertHookState} from "./RevertHookState.sol";
+
+/// @title RevertHookTriggers
+/// @notice Abstract contract containing trigger management functions for RevertHook
+/// @dev Inherits from RevertHookState and provides trigger add/remove/compute functionality
+abstract contract RevertHookTriggers is RevertHookState {
+    using PoolIdLibrary for PoolKey;
+    using TickLinkedList for TickLinkedList.List;
+
+    // ==================== Abstract Functions ====================
+
+    /// @notice Gets position and pool info - must be implemented by child
+    function _getPoolAndPositionInfo(uint256 tokenId) internal view virtual returns (PoolKey memory, PositionInfo);
+
+    /// @notice Returns the owner of the position - must be implemented by child
+    function _getOwner(uint256 tokenId, bool resolveVaultOwner) internal view virtual returns (address);
+
+    function _getCurrentTick(PoolId poolId) internal view virtual returns (int24);
+
+    // ==================== Tick Helpers ====================
+
+    /// @notice Calculates the tick lower for a given tick and spacing
+    function _getTickLower(int24 tick, int24 tickSpacing) internal pure returns (int24) {
+        int24 compressed = tick / tickSpacing;
+        if (tick < 0 && tick % tickSpacing != 0) compressed--;
+        return compressed * tickSpacing;
+    }
+
+    /// @notice Validates that a tick config is aligned to tick spacing (unless it's a sentinel value)
+    /// @param tick The tick value to validate
+    /// @param tickSpacing The pool's tick spacing
+    /// @param sentinel The sentinel value that bypasses validation (type(int24).min or type(int24).max)
+    /// @return valid True if tick is valid (aligned to spacing or equals sentinel)
+    function _isValidTickConfig(int24 tick, int24 tickSpacing, int24 sentinel) internal pure returns (bool valid) {
+        return tick == sentinel || tick % tickSpacing == 0;
+    }
+
+    /// @dev Applies a configured relative offset to a position bound in int256 and saturates at the
+    ///      int24 sentinels. A config that fits its initial range can overflow int24 once it is
+    ///      re-applied to a replacement range clamped at the usable tick bound (an AUTO_RANGE
+    ///      remint); the checked int24 addition then failed the whole arming inside the action, which
+    ///      rolled back the remint after the old triggers had already been consumed (V4LE-130). A
+    ///      threshold past the int24 range lies past every reachable tick, so the saturated value is
+    ///      exactly the disabled sentinel for that side. Dispatch recomputes exit ticks the same way.
+    function _offsetTick(int24 tick, int256 offset) internal pure returns (int24) {
+        int256 result = int256(tick) + offset;
+        if (result > type(int24).max) return type(int24).max;
+        if (result < type(int24).min) return type(int24).min;
+        return int24(result);
+    }
+
+    /// @notice Calculates AUTO_RANGE trigger ticks based on position range and limits
+    /// @param tickLower Position's lower tick
+    /// @param tickUpper Position's upper tick
+    /// @param autoRangeLowerLimit Lower limit config (type(int24).min means disabled)
+    /// @param autoRangeUpperLimit Upper limit config (type(int24).max means disabled)
+    /// @return rangeLower Lower trigger tick (type(int24).min if disabled)
+    /// @return rangeUpper Upper trigger tick (type(int24).max if disabled)
+    function _calculateRangeTriggerTicks(
+        int24 tickLower,
+        int24 tickUpper,
+        int24 autoRangeLowerLimit,
+        int24 autoRangeUpperLimit
+    ) internal pure returns (int24 rangeLower, int24 rangeUpper) {
+        rangeLower = autoRangeLowerLimit != type(int24).min
+            ? _offsetTick(tickLower, -int256(autoRangeLowerLimit))
+            : type(int24).min;
+        rangeUpper = autoRangeUpperLimit != type(int24).max
+            ? _offsetTick(tickUpper, int256(autoRangeUpperLimit))
+            : type(int24).max;
+    }
+
+    /// @notice Calculates AUTO_LEVERAGE trigger ticks based on base tick
+    /// @param baseTick The base tick for leverage triggers
+    /// @param tickSpacing The pool's tick spacing
+    /// @return leverageLower Lower trigger tick
+    /// @return leverageUpper Upper trigger tick
+    function _calculateLeverageTriggerTicks(int24 baseTick, int24 tickSpacing)
+        internal
+        pure
+        returns (int24 leverageLower, int24 leverageUpper)
+    {
+        leverageLower = baseTick - _LEVERAGE_TICK_OFFSET_MULTIPLIER * tickSpacing;
+        leverageUpper = baseTick + _LEVERAGE_TICK_OFFSET_MULTIPLIER * tickSpacing;
+    }
+
+    // ==================== Position Config Helpers ====================
+
+    /// @notice Disables a position by setting its config to NONE
+    function _disablePosition(uint256 tokenId) internal {
+        PositionConfig memory emptyConfig = _getEmptyPositionConfig();
+        _positionConfigs[tokenId] = emptyConfig;
+        _deactivatePosition(tokenId);
+        emit SetPositionConfig(tokenId, emptyConfig);
+    }
+
+    /// @notice Returns an empty position config with default/sentinel values
+    function _getEmptyPositionConfig() internal pure returns (PositionConfig memory config) {
+        config = PositionConfig({
+            modeFlags: PositionModeFlags.MODE_NONE,
+            autoCollectMode: AutoCollectMode.NONE,
+            autoExitIsRelative: false,
+            autoExitSwapOnLowerTrigger: true,
+            autoExitSwapOnUpperTrigger: true,
+            autoExitTickLower: type(int24).min,
+            autoExitTickUpper: type(int24).max,
+            autoRangeLowerLimit: type(int24).min,
+            autoRangeUpperLimit: type(int24).max,
+            autoRangeLowerDelta: 0,
+            autoRangeUpperDelta: 0,
+            autoLendToleranceTick: 0,
+            autoLeverageTargetBps: 0
+        });
+    }
+
+    // ==================== Config Validation (shared with delegate targets) ====================
+
+    /// @dev Auto-range settings must not be able to resolve a trigger back into the current range.
+    ///      Pure and range-dependent, so it is shared: the hook uses it in setPositionConfig and the
+    ///      sidecar re-runs it when a vault remint moves a config onto a position with a new range.
+    function _validateRangeConfig(
+        int24 tickSpacing,
+        int24 positionTickLower,
+        int24 positionTickUpper,
+        PositionConfig memory config
+    ) internal pure {
+        if (!PositionModeFlags.hasAutoRange(config.modeFlags)) {
+            return;
+        }
+
+        if (config.autoRangeLowerDelta >= config.autoRangeUpperDelta) {
+            revert InvalidConfig();
+        }
+
+        // The replacement AutoRangeLib.plan mints from a trigger fired in bucket B is
+        // [B + lowerDelta, B + upperDelta], so its own triggers sit at B + lowerDelta - lowerLimit
+        // and B + upperDelta + upperLimit, and a relative exit at B + lowerDelta - exitLower and
+        // B + upperDelta + exitUpper: whether one of them is already satisfied at B does not depend
+        // on B at all, only on the config. Such a trigger would be inserted at or behind the
+        // traversal cursor (which rests on the fired bucket and searches strictly past it) and lie
+        // dormant until a full recross, leaving the reminted position unprotected (V4LE-16). The
+        // vault remint path re-checks the live tick because a manual range change is arbitrary;
+        // the hook's own remint is fully determined here, so refuse the configuration up front.
+        if (
+            (config.autoRangeLowerLimit != type(int24).min && config.autoRangeLowerDelta >= config.autoRangeLowerLimit)
+                || (
+                    config.autoRangeUpperLimit != type(int24).max
+                        && int256(config.autoRangeUpperDelta) + int256(config.autoRangeUpperLimit) <= 0
+                )
+        ) {
+            revert InvalidConfig();
+        }
+        if (PositionModeFlags.hasAutoExit(config.modeFlags) && config.autoExitIsRelative) {
+            if (
+                (config.autoExitTickLower != type(int24).min && config.autoExitTickLower <= config.autoRangeLowerDelta)
+                    || (
+                        config.autoExitTickUpper != type(int24).max
+                            && int256(config.autoExitTickUpper) + int256(config.autoRangeUpperDelta) <= 0
+                    )
+            ) {
+                revert InvalidConfig();
+            }
+        }
+
+        (int24 rangeLower, int24 rangeUpper) = _calculateRangeTriggerTicks(
+            positionTickLower, positionTickUpper, config.autoRangeLowerLimit, config.autoRangeUpperLimit
+        );
+
+        if (
+            _rangeTriggerCanResolveToSamePosition(
+                    positionTickLower,
+                    positionTickUpper,
+                    rangeLower,
+                    config.autoRangeLowerDelta,
+                    config.autoRangeUpperDelta,
+                    tickSpacing,
+                    false
+                )
+                || _rangeTriggerCanResolveToSamePosition(
+                    positionTickLower,
+                    positionTickUpper,
+                    rangeUpper,
+                    config.autoRangeLowerDelta,
+                    config.autoRangeUpperDelta,
+                    tickSpacing,
+                    true
+                )
+        ) {
+            revert InvalidConfig();
+        }
+    }
+
+    /// @dev Whether some bucket at or past `triggerTick` makes AutoRangeLib.plan reproduce the
+    ///      current range, which the action would then refuse. Only two candidate buckets can: the
+    ///      one whose unclamped shift lands on the current lower tick and the one landing on the
+    ///      current upper tick; the planner's clamp at the usable tick bounds is applied to the other
+    ///      side, so an edge position ([.., maxUsableTick] with an upper trigger, or
+    ///      [minUsableTick, ..] with a lower one) whose clamped replacement is itself is caught here
+    ///      instead of consuming the trigger at run time (V4LE-74).
+    function _rangeTriggerCanResolveToSamePosition(
+        int24 currentTickLower,
+        int24 currentTickUpper,
+        int24 triggerTick,
+        int24 lowerDelta,
+        int24 upperDelta,
+        int24 tickSpacing,
+        bool isUpperTrigger
+    ) internal pure returns (bool) {
+        if (triggerTick == type(int24).min || triggerTick == type(int24).max) {
+            return false;
+        }
+        return _baseTickReproducesRange(
+            int256(currentTickLower) - int256(lowerDelta),
+            currentTickLower,
+            currentTickUpper,
+            triggerTick,
+            lowerDelta,
+            upperDelta,
+            tickSpacing,
+            isUpperTrigger
+        )
+            || _baseTickReproducesRange(
+                int256(currentTickUpper) - int256(upperDelta),
+                currentTickLower,
+                currentTickUpper,
+                triggerTick,
+                lowerDelta,
+                upperDelta,
+                tickSpacing,
+                isUpperTrigger
+            );
+    }
+
+    function _baseTickReproducesRange(
+        int256 baseTick,
+        int24 currentTickLower,
+        int24 currentTickUpper,
+        int24 triggerTick,
+        int24 lowerDelta,
+        int24 upperDelta,
+        int24 tickSpacing,
+        bool isUpperTrigger
+    ) internal pure returns (bool) {
+        if (baseTick % int256(tickSpacing) != 0) {
+            return false;
+        }
+        if (isUpperTrigger ? baseTick < int256(triggerTick) : baseTick > int256(triggerTick)) {
+            return false;
+        }
+        int256 plannedLower = baseTick + int256(lowerDelta);
+        int256 plannedUpper = baseTick + int256(upperDelta);
+        int256 minTick = int256(TickMath.minUsableTick(tickSpacing));
+        int256 maxTick = int256(TickMath.maxUsableTick(tickSpacing));
+        if (plannedLower < minTick) plannedLower = minTick;
+        if (plannedUpper > maxTick) plannedUpper = maxTick;
+        return plannedLower == int256(currentTickLower) && plannedUpper == int256(currentTickUpper);
+    }
+
+    // ==================== Carried protocol fee ====================
+
+    /// @dev A carried protocol fee follows the position to its replacement. The retired token is an
+    ///      empty husk that may never see another liquidity operation, and a one-sided withdrawal can
+    ///      only ever absorb the fee owed in the currency it actually holds.
+    function _migratePendingProtocolFee(PoolKey memory poolKey, uint256 tokenId, uint256 newTokenId) internal {
+        PendingProtocolFee storage pending = _pendingProtocolFees[tokenId];
+        uint128 amount0 = pending.amount0;
+        uint128 amount1 = pending.amount1;
+        if (amount0 == 0 && amount1 == 0) {
+            return;
+        }
+        delete _pendingProtocolFees[tokenId];
+        emit ProtocolFeeDeferred(tokenId, poolKey.currency0, poolKey.currency1, 0, 0);
+
+        PendingProtocolFee storage target = _pendingProtocolFees[newTokenId];
+        target.amount0 += amount0;
+        target.amount1 += amount1;
+        emit ProtocolFeeDeferred(newTokenId, poolKey.currency0, poolKey.currency1, target.amount0, target.amount1);
+    }
+
+    // ==================== Activation Helpers ====================
+
+    /// @notice Marks position as activated (triggers are now active)
+    function _activatePosition(uint256 tokenId) internal {
+        if (_positionStates[tokenId].lastActivated == 0) {
+            _positionStates[tokenId].lastActivated = uint32(block.timestamp);
+        }
+    }
+
+    /// @notice Marks position as deactivated
+    function _deactivatePosition(uint256 tokenId) internal {
+        uint32 lastActivated = _positionStates[tokenId].lastActivated;
+        if (lastActivated > 0) {
+            _positionStates[tokenId].accumulatedActiveTime += uint32(block.timestamp) - lastActivated;
+            _positionStates[tokenId].lastActivated = 0;
+        }
+    }
+
+    /// @notice Checks if position is currently activated
+    function _isActivated(uint256 tokenId) internal view returns (bool) {
+        return _positionStates[tokenId].lastActivated > 0;
+    }
+
+    // ==================== Trigger Management ====================
+
+    /// @notice Adds position triggers based on the current position configuration
+    function _addPositionTriggers(uint256 tokenId, PoolKey memory poolKey) internal {
+        PositionConfig storage config = _positionConfigs[tokenId];
+
+        if (!PositionModeFlags.hasTriggers(config.modeFlags)) {
+            return;
+        }
+
+        PoolId poolId = poolKey.toId();
+
+        // The afterSwap loop leaves the tick cursor stale while a pool has never registered a
+        // trigger (it skips all trigger bookkeeping for gas). Re-baseline the cursor to the
+        // current bucket when the first trigger registers, so price movement from before
+        // registration can never fire it. The flag is sticky: a pool that once had triggers keeps
+        // the full afterSwap path, which is the pre-gate behaviour.
+        TriggerCursor storage triggerCursor = _triggerCursors[poolId];
+        if (!triggerCursor.hasTriggers) {
+            triggerCursor.tickLowerLast = _getTickLower(_getCurrentTick(poolId), poolKey.tickSpacing);
+            triggerCursor.tickLowerOpposite = triggerCursor.tickLowerLast;
+            triggerCursor.hasTriggers = true;
+        }
+
+        (, PositionInfo posInfo) = _getPoolAndPositionInfo(tokenId);
+        int24[4] memory ticks = _computeTriggerTicks(tokenId, poolKey, config, posInfo.tickLower(), posInfo.tickUpper());
+        _insertTriggerTicks(poolId, tokenId, ticks);
+    }
+
+    /// @dev Registration guard for the external arming paths (setPositionConfig, a vault remint).
+    ///      While the cursor lags the live bucket - dispatch was deferred because the pool sits
+    ///      outside the oracle window, or a swap hit the per-swap action cap - a trigger inserted
+    ///      relative to the live price can land on the far side of the pending walk: the next
+    ///      in-window swap infers its direction from cursor to live and would never visit it.
+    ///      Refuse instead; the caller retries once a swap has brought the pool back in line.
+    ///      Not used on the hook's own arming inside a walk: the walk retains both directional
+    ///      cursors so newly armed ticks remain reachable even if an action leaves the oracle window.
+    function _requireTriggerCursorFresh(PoolId poolId, int24 tickSpacing) internal view {
+        TriggerCursor storage triggerCursor = _triggerCursors[poolId];
+        if (
+            triggerCursor.hasTriggers
+                && (triggerCursor.tickLowerLast != triggerCursor.tickLowerOpposite
+                    || triggerCursor.tickLowerLast != _getTickLower(_getCurrentTick(poolId), tickSpacing))
+        ) {
+            revert TriggerCursorStale();
+        }
+    }
+
+    /// @notice Inserts precomputed trigger ticks into the linked lists
+    function _insertTriggerTicks(PoolId poolId, uint256 tokenId, int24[4] memory ticks) internal {
+        TickLinkedList.List storage lowerList = _lowerTriggerAfterSwap[poolId];
+        TickLinkedList.List storage upperList = _upperTriggerAfterSwap[poolId];
+
+        if (!upperList.increasing) {
+            upperList.increasing = true;
+        }
+
+        if (ticks[0] != type(int24).min) lowerList.insert(ticks[0], tokenId);
+        if (ticks[1] != type(int24).min) lowerList.insert(ticks[1], tokenId);
+        if (ticks[2] != type(int24).max) upperList.insert(ticks[2], tokenId);
+        if (ticks[3] != type(int24).max) upperList.insert(ticks[3], tokenId);
+    }
+
+    /// @notice Removes position triggers based on the current position configuration
+    function _removePositionTriggers(uint256 tokenId, PoolKey memory poolKey) internal {
+        _removePositionTriggersWithConfig(tokenId, poolKey, _positionConfigs[tokenId]);
+    }
+
+    /// @notice Removes position triggers using an explicit config snapshot
+    /// @dev Used when a caller must remove old trigger nodes before mutating config/base-tick state.
+    function _removePositionTriggersWithConfig(uint256 tokenId, PoolKey memory poolKey, PositionConfig memory config)
+        internal
+    {
+        if (!PositionModeFlags.hasTriggers(config.modeFlags)) {
+            return;
+        }
+
+        PoolId poolId = poolKey.toId();
+        (, PositionInfo posInfo) = _getPoolAndPositionInfo(tokenId);
+
+        TickLinkedList.List storage lowerList = _lowerTriggerAfterSwap[poolId];
+        TickLinkedList.List storage upperList = _upperTriggerAfterSwap[poolId];
+
+        int24[4] memory ticks =
+            _computeTriggerTicksMemory(tokenId, poolKey, config, posInfo.tickLower(), posInfo.tickUpper());
+
+        if (ticks[0] != type(int24).min) lowerList.remove(ticks[0], tokenId);
+        if (ticks[1] != type(int24).min) lowerList.remove(ticks[1], tokenId);
+        if (ticks[2] != type(int24).max) upperList.remove(ticks[2], tokenId);
+        if (ticks[3] != type(int24).max) upperList.remove(ticks[3], tokenId);
+    }
+
+    /// @notice Updates position triggers by computing diff between old and new configs
+    function _updatePositionTriggers(uint256 tokenId, PoolKey memory poolKey, PositionConfig memory newConfig)
+        internal
+    {
+        _updatePositionTriggersInternal(tokenId, poolKey, newConfig, false);
+    }
+
+    /// @notice Updates position triggers with optional force flag
+    function _updatePositionTriggersInternal(
+        uint256 tokenId,
+        PoolKey memory poolKey,
+        PositionConfig memory newConfig,
+        bool force
+    ) internal {
+        PositionConfig storage oldConfig = _positionConfigs[tokenId];
+
+        bool oldHasTriggers = !force && PositionModeFlags.hasTriggers(oldConfig.modeFlags);
+        bool newHasTriggers = PositionModeFlags.hasTriggers(newConfig.modeFlags);
+
+        if (!oldHasTriggers && !newHasTriggers) {
+            return;
+        }
+
+        PoolId poolId = poolKey.toId();
+        (, PositionInfo posInfo) = _getPoolAndPositionInfo(tokenId);
+
+        TickLinkedList.List storage lowerList = _lowerTriggerAfterSwap[poolId];
+        TickLinkedList.List storage upperList = _upperTriggerAfterSwap[poolId];
+
+        if (!upperList.increasing) {
+            upperList.increasing = true;
+        }
+
+        int24[4] memory oldTicks;
+        if (force) {
+            oldTicks[0] = type(int24).min;
+            oldTicks[1] = type(int24).min;
+            oldTicks[2] = type(int24).max;
+            oldTicks[3] = type(int24).max;
+        } else {
+            oldTicks = _computeTriggerTicks(tokenId, poolKey, oldConfig, posInfo.tickLower(), posInfo.tickUpper());
+        }
+        int24[4] memory newTicks =
+            _computeTriggerTicksMemory(tokenId, poolKey, newConfig, posInfo.tickLower(), posInfo.tickUpper());
+
+        _updateTriggerList(lowerList, tokenId, oldTicks[0], oldTicks[1], newTicks[0], newTicks[1], type(int24).min);
+        _updateTriggerList(upperList, tokenId, oldTicks[2], oldTicks[3], newTicks[2], newTicks[3], type(int24).max);
+    }
+
+    /// @notice Updates a single trigger list by removing old and adding new ticks
+    function _updateTriggerList(
+        TickLinkedList.List storage list,
+        uint256 tokenId,
+        int24 old1,
+        int24 old2,
+        int24 new1,
+        int24 new2,
+        int24 sentinel
+    ) internal {
+        if (old1 != sentinel && old1 != new1 && old1 != new2) list.remove(old1, tokenId);
+        if (old2 != sentinel && old2 != new1 && old2 != new2) list.remove(old2, tokenId);
+        if (new1 != sentinel && new1 != old1 && new1 != old2) list.insert(new1, tokenId);
+        if (new2 != sentinel && new2 != old1 && new2 != old2) list.insert(new2, tokenId);
+    }
+
+    // ==================== Trigger Tick Computation ====================
+
+    /// @notice Computes trigger ticks for a position config (storage version)
+    function _computeTriggerTicks(
+        uint256 tokenId,
+        PoolKey memory poolKey,
+        PositionConfig storage config,
+        int24 tickLower,
+        int24 tickUpper
+    ) internal view returns (int24[4] memory ticks) {
+        return _computeTriggerTicksCore(
+            tokenId,
+            poolKey,
+            config.modeFlags,
+            config.autoRangeLowerLimit,
+            config.autoRangeUpperLimit,
+            config.autoExitIsRelative,
+            config.autoExitTickLower,
+            config.autoExitTickUpper,
+            config.autoLendToleranceTick,
+            tickLower,
+            tickUpper
+        );
+    }
+
+    /// @notice Computes trigger ticks for a position config (memory version)
+    function _computeTriggerTicksMemory(
+        uint256 tokenId,
+        PoolKey memory poolKey,
+        PositionConfig memory config,
+        int24 tickLower,
+        int24 tickUpper
+    ) internal view returns (int24[4] memory ticks) {
+        return _computeTriggerTicksCore(
+            tokenId,
+            poolKey,
+            config.modeFlags,
+            config.autoRangeLowerLimit,
+            config.autoRangeUpperLimit,
+            config.autoExitIsRelative,
+            config.autoExitTickLower,
+            config.autoExitTickUpper,
+            config.autoLendToleranceTick,
+            tickLower,
+            tickUpper
+        );
+    }
+
+    /// @notice Core trigger tick computation logic
+    /// @dev Trigger slots: [0]=range/leverage lower (first trigger going down), [1]=exit lower,
+    ///      [2]=range/leverage upper (first trigger going up), [3]=exit upper
+    ///      When AUTO_RANGE and AUTO_LEVERAGE are combined, we use the trigger that fires first in each direction.
+    function _computeTriggerTicksCore(
+        uint256 tokenId,
+        PoolKey memory poolKey,
+        uint8 modeFlags,
+        int24 autoRangeLowerLimit,
+        int24 autoRangeUpperLimit,
+        bool autoExitIsRelative,
+        int24 autoExitTickLower,
+        int24 autoExitTickUpper,
+        int24 autoLendToleranceTick,
+        int24 tickLower,
+        int24 tickUpper
+    ) internal view returns (int24[4] memory ticks) {
+        ticks[0] = type(int24).min;
+        ticks[1] = type(int24).min;
+        ticks[2] = type(int24).max;
+        ticks[3] = type(int24).max;
+
+        if (!PositionModeFlags.hasTriggers(modeFlags)) {
+            return ticks;
+        }
+
+        bool hasAutoRange = PositionModeFlags.hasAutoRange(modeFlags);
+        bool hasAutoLeverage = PositionModeFlags.hasAutoLeverage(modeFlags);
+
+        // Compute AUTO_RANGE trigger ticks
+        int24 rangeLower = type(int24).min;
+        int24 rangeUpper = type(int24).max;
+        if (hasAutoRange) {
+            (rangeLower, rangeUpper) =
+                _calculateRangeTriggerTicks(tickLower, tickUpper, autoRangeLowerLimit, autoRangeUpperLimit);
+        }
+
+        // Compute AUTO_LEVERAGE trigger ticks
+        int24 leverageLower = type(int24).min;
+        int24 leverageUpper = type(int24).max;
+        if (hasAutoLeverage) {
+            int24 baseTick = _positionStates[tokenId].autoLeverageBaseTick;
+            (leverageLower, leverageUpper) = _calculateLeverageTriggerTicks(baseTick, poolKey.tickSpacing);
+        }
+
+        // When both AUTO_RANGE and AUTO_LEVERAGE are set, use the trigger that fires first in each direction:
+        // - Going DOWN: first trigger = higher tick value (closer to current price)
+        // - Going UP: first trigger = lower tick value (closer to current price)
+        if (hasAutoRange && hasAutoLeverage) {
+            // For lower triggers (price going down), use the HIGHER tick (fires first)
+            ticks[0] = rangeLower > leverageLower ? rangeLower : leverageLower;
+            // For upper triggers (price going up), use the LOWER tick (fires first)
+            ticks[2] = rangeUpper < leverageUpper ? rangeUpper : leverageUpper;
+        } else if (hasAutoRange) {
+            ticks[0] = rangeLower;
+            ticks[2] = rangeUpper;
+        } else if (hasAutoLeverage) {
+            ticks[0] = leverageLower;
+            ticks[2] = leverageUpper;
+        }
+
+        // AUTO_EXIT triggers (ticks[1] and ticks[3], or ticks[0]/ticks[2] if no range/leverage)
+        if (PositionModeFlags.hasAutoExit(modeFlags)) {
+            int24 exitLower;
+            int24 exitUpper;
+            if (autoExitIsRelative) {
+                exitLower = autoExitTickLower != type(int24).min
+                    ? _offsetTick(tickLower, -int256(autoExitTickLower))
+                    : type(int24).min;
+                exitUpper = autoExitTickUpper != type(int24).max
+                    ? _offsetTick(tickUpper, int256(autoExitTickUpper))
+                    : type(int24).max;
+            } else {
+                exitLower = autoExitTickLower;
+                exitUpper = autoExitTickUpper;
+            }
+            // Place exit triggers in slots [1] and [3] if range/leverage triggers exist, otherwise in [0] and [2]
+            if (ticks[0] != type(int24).min) {
+                ticks[1] = exitLower;
+            } else {
+                ticks[0] = exitLower;
+            }
+            if (ticks[2] != type(int24).max) {
+                ticks[3] = exitUpper;
+            } else {
+                ticks[2] = exitUpper;
+            }
+        }
+
+        // AUTO_LEND triggers (mutually exclusive with AUTO_EXIT and AUTO_LEVERAGE per validation)
+        if (PositionModeFlags.hasAutoLend(modeFlags)) {
+            PositionState storage state = _positionStates[tokenId];
+            if (state.autoLendShares > 0) {
+                // The withdrawal re-arms while the walk's cursor rests on the bucket the deposit fired
+                // from, and the next search is strictly past the cursor. With a positive (aligned,
+                // so >= spacing) tolerance the withdrawal sits `tolerance` inside the deposit bucket
+                // and is found; with zero tolerance both formulas met on the fired bucket and the
+                // ordinary one-bucket recovery skipped the node until a full recross (V4LE-126).
+                // Zero tolerance therefore rests the withdrawal one spacing toward the range, i.e. on
+                // the first bucket where the position is back in range.
+                if (Currency.unwrap(poolKey.currency0) == state.autoLendToken) {
+                    ticks[2] = autoLendToleranceTick == 0
+                        ? tickLower
+                        : tickLower - autoLendToleranceTick - poolKey.tickSpacing;
+                } else {
+                    ticks[0] = autoLendToleranceTick == 0
+                        ? tickUpper - poolKey.tickSpacing
+                        : tickUpper + autoLendToleranceTick;
+                }
+            } else {
+                ticks[0] = tickLower - autoLendToleranceTick * 2 - poolKey.tickSpacing;
+                ticks[2] = tickUpper + autoLendToleranceTick * 2;
+            }
+        }
+    }
+}

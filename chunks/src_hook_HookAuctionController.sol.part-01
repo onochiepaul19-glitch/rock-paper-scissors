@@ -1,0 +1,501 @@
+elease(PoolId poolId)
+        external
+        view
+        returns (uint64 pendingLastDripTime, uint128 pendingReleasePerEpoch)
+    {
+        PoolAuctionState storage state = _poolStates[poolId];
+        return (state.pendingLastDripTime, state.pendingReleasePerEpoch);
+    }
+
+    /// @notice Whether a pool has an auction configuration (independent of any activity).
+    function isConfigured(PoolId poolId) external view returns (bool) {
+        return _isConfigured(_poolConfigs[poolId]);
+    }
+
+    /// @notice The slot-0 hot-path mirrors (see PoolAuctionState). Exposed so the invariant
+    ///         suite and off-chain monitoring can verify they never diverge from the structs.
+    function getHotPathMirrors(PoolId poolId)
+        external
+        view
+        returns (address activeExecutor, bool activeHasBid, bool hasPending)
+    {
+        PoolAuctionState storage state = _poolStates[poolId];
+        return (state.activeExecutor, state.activeHasBid, state.hasPending);
+    }
+
+    /// @notice Rollover-aware view of the winner whose executor receives the fee discount RIGHT
+    ///         NOW, matching what beforeSwap would apply after its sync. Use this (not the raw
+    ///         getEpochAuction) to identify the current winner across untouched epoch boundaries.
+    function getActiveWinner(PoolId poolId)
+        external
+        view
+        returns (address bidder, address executor, uint256 bid, uint24 lpFee)
+    {
+        PoolAuctionConfig storage config = _poolConfigs[poolId];
+        if (!_isRunning(config)) {
+            return (address(0), address(0), 0, 0);
+        }
+        PoolAuctionState storage state = _poolStates[poolId];
+        EpochAuction storage auction = state.active;
+        if (_rolloverPending(config, state)) {
+            if (_currentEpoch(config) == state.activeEpoch + 1) {
+                // a single-epoch advance promotes the queued bid to active
+                auction = state.next;
+            } else {
+                // multi-epoch skip: the queued bid's epoch already ended (it is consumed to the
+                // LPs' pending bucket at the next sync), nobody is the winner now
+                return (address(0), address(0), 0, 0);
+            }
+        }
+        if (auction.bid == 0) {
+            return (address(0), address(0), 0, 0);
+        }
+        return (auction.bidder, auction.executor, auction.bid, _winnerLpFee(config));
+    }
+
+    /// @notice Returns the raw stored auction slot of the currently active or the next epoch.
+    /// @dev Values reflect stored state; call drip() or wait for a pool action to sync epochs
+    ///      (or use getActiveWinner / minNextBid, which are rollover-aware).
+    function getEpochAuction(PoolId poolId, bool nextEpoch)
+        external
+        view
+        returns (
+            address bidder,
+            address executor,
+            uint256 bid,
+            uint256 totalDrip,
+            uint256 donated,
+            uint64 lastDripTime,
+            bool materialized
+        )
+    {
+        // materialized is derived: a nonzero bid materializes to a nonzero totalDrip
+        PoolAuctionState storage state = _poolStates[poolId];
+        EpochAuction storage auction = nextEpoch ? state.next : state.active;
+        return (
+            auction.bidder,
+            auction.executor,
+            auction.bid,
+            auction.totalDrip,
+            auction.donated,
+            auction.lastDripTime,
+            auction.totalDrip != 0
+        );
+    }
+
+    function currentEpoch(PoolId poolId) external view returns (uint64) {
+        PoolAuctionConfig storage config = _poolConfigs[poolId];
+        if (!_isConfigured(config)) {
+            revert PoolNotConfigured();
+        }
+        if (block.timestamp < config.epochStartTime) {
+            revert AuctionNotStarted();
+        }
+        return _currentEpoch(config);
+    }
+
+    /// @notice Minimum accepted bid for the next epoch of a pool.
+    /// @dev Accounts for a not-yet-synced epoch rollover: once the current epoch has advanced
+    ///      past the stored one, bidNext will reset the next slot, so the effective current bid
+    ///      to beat is 0 (the opening reserve). Reading the raw stored next.bid here would quote
+    ///      the previous epoch's winning bid and make a keeper overpay.
+    function minNextBid(PoolId poolId) external view returns (uint256) {
+        PoolAuctionConfig storage config = _poolConfigs[poolId];
+        if (!_isConfigured(config)) {
+            revert PoolNotConfigured();
+        }
+        PoolAuctionState storage state = _poolStates[poolId];
+        uint128 effectiveNextBid = _rolloverPending(config, state) ? 0 : state.next.bid;
+        return _minNextBid(config, effectiveNextBid);
+    }
+
+    /// @dev True when a bidNext call would sync the pool to a later epoch, resetting the next slot.
+    function _rolloverPending(PoolAuctionConfig storage config, PoolAuctionState storage state)
+        internal
+        view
+        returns (bool)
+    {
+        return
+            state.epochsSynced && block.timestamp >= config.epochStartTime && _currentEpoch(config) > state.activeEpoch;
+    }
+
+    /// @notice The LP fee the epoch winner's executor pays on this pool.
+    function winnerLpFee(PoolId poolId) external view returns (uint24) {
+        PoolAuctionConfig storage config = _poolConfigs[poolId];
+        if (!_isConfigured(config)) {
+            revert PoolNotConfigured();
+        }
+        return _winnerLpFee(config);
+    }
+
+    // ==================== Internal: epoch machine ====================
+
+    function _isConfigured(PoolAuctionConfig storage config) internal view returns (bool) {
+        return config.epochLengthSeconds != 0;
+    }
+
+    function _isRunning(PoolAuctionConfig storage config) internal view returns (bool) {
+        return _isConfigured(config) && block.timestamp >= config.epochStartTime;
+    }
+
+    function _currentEpoch(PoolAuctionConfig storage config) internal view returns (uint64) {
+        return uint64((block.timestamp - config.epochStartTime) / config.epochLengthSeconds);
+    }
+
+    function _winnerLpFee(PoolAuctionConfig storage config) internal view returns (uint24) {
+        return uint24(uint256(config.normalLpFee) - uint256(config.normalLpFee) * config.feeDiscountPpm / PPM);
+    }
+
+    function _minNextBid(PoolAuctionConfig storage config, uint128 currentBid) internal view returns (uint256) {
+        if (currentBid == 0) {
+            return config.openingBidReserve; // validated nonzero in configurePool
+        }
+        uint256 bump = uint256(currentBid) * config.minBidBumpPpm / PPM;
+        // saturate at the bid cap (same as HookLeaseController.minBuyoutPrice): a standing bid at
+        // or bumped past the cap stays contestable at the cap itself - equal amount - so no bid
+        // can make the next epoch un-outbiddable
+        uint256 required = uint256(currentBid) + (bump > 0 ? bump : 1);
+        return required > MAX_BID_AMOUNT ? MAX_BID_AMOUNT : required;
+    }
+
+    /// @dev Rolls the stored epoch state forward to the current epoch. Fully vests and
+    ///      carries skipped epochs into the pending-donation bucket.
+    function _syncPool(PoolId poolId, PoolAuctionConfig storage config)
+        internal
+        returns (PoolAuctionState storage state)
+    {
+        state = _poolStates[poolId];
+        uint64 current = _currentEpoch(config);
+        if (!state.epochsSynced) {
+            state.epochsSynced = true;
+            state.activeEpoch = current;
+            return state;
+        }
+        if (current <= state.activeEpoch) {
+            return state;
+        }
+
+        _carryEpoch(poolId, config, state, state.activeEpoch, state.active);
+        if (current == state.activeEpoch + 1) {
+            EpochAuction storage promoted = state.next;
+            // maintain the slot-0 mirrors before the struct copy consumes `next`
+            state.activeExecutor = promoted.executor;
+            state.activeHasBid = promoted.bid != 0;
+            state.active = promoted;
+            delete state.next;
+        } else {
+            // More than one epoch skipped: the epoch-N+1 winner's discount right was live for
+            // all of epoch N+1 regardless of promotion - sync is lazy, so their executor's
+            // first swap would have promoted the bid and received the discount. A no-show bid
+            // is therefore consumed like any other won epoch: materialized and carried to the
+            // LPs' pending bucket. (Refunding it instead would make the outcome depend on
+            // whether any third party touched the pool mid-epoch - a permissionless drip()
+            // could then decide between refund and distribution - and would hand every winner
+            // a free option to bid, squat the epoch, and be made whole if they never swap.)
+            _carryEpoch(poolId, config, state, state.activeEpoch + 1, state.next);
+            delete state.active;
+            delete state.next;
+            state.activeExecutor = address(0);
+            state.activeHasBid = false;
+        }
+        state.activeEpoch = current;
+    }
+
+    function _carryEpoch(
+        PoolId poolId,
+        PoolAuctionConfig storage config,
+        PoolAuctionState storage state,
+        uint64 epoch,
+        EpochAuction storage auction
+    ) internal {
+        if (auction.bid == 0) {
+            return;
+        }
+        _materializeEpoch(poolId, config, epoch, auction);
+
+        uint128 remaining = auction.totalDrip - auction.donated;
+        if (remaining == 0) {
+            return;
+        }
+        auction.donated = auction.totalDrip;
+        _addPending(state, remaining, auction.totalDrip);
+    }
+
+    /// @dev Adds to the pending-donation bucket, (re)initializing the throttle clock whenever the
+    ///      bucket transitions from empty to non-empty. Without this, a stale pendingLastDripTime
+    ///      left over from a previously-drained bucket would let the first drip of a fresh bucket
+    ///      compute a full-epoch elapsed interval and release the whole thing to a same-block JIT.
+    ///      `epochDrip` is the totalDrip of the epoch the value came from; the bucket releases at
+    ///      the pace of the largest contributing epoch (see pendingReleasePerEpoch).
+    function _addPending(PoolAuctionState storage state, uint256 amount, uint128 epochDrip) internal {
+        if (amount == 0) {
+            return;
+        }
+        if (state.pendingDonation == 0) {
+            state.pendingLastDripTime = uint64(block.timestamp);
+            state.hasPending = true;
+        }
+        if (epochDrip > state.pendingReleasePerEpoch) {
+            state.pendingReleasePerEpoch = epochDrip;
+        }
+        state.pendingDonation += amount;
+    }
+
+    /// @dev Splits the winning bid into protocol fee and drip amount, exactly once per epoch.
+    function _materializeEpoch(
+        PoolId poolId,
+        PoolAuctionConfig storage config,
+        uint64 epoch,
+        EpochAuction storage auction
+    ) internal {
+        // callers guard on a nonzero bid (directly or via the activeHasBid mirror), and a
+        // materialized nonzero bid always has a nonzero totalDrip (protocol fee is capped at
+        // 20%), so totalDrip doubles as the materialized flag
+        if (auction.totalDrip != 0) {
+            return;
+        }
+
+        uint256 protocolFee = uint256(auction.bid) * config.protocolFeeBps / BPS_DENOMINATOR;
+        auction.totalDrip = auction.bid - uint128(protocolFee);
+        if (protocolFee != 0) {
+            protocolFeesAccrued[config.auctionCurrency][config.protocolFeeRecipient] += protocolFee;
+        }
+        emit EpochMaterialized(poolId, epoch, auction.executor, auction.bid, protocolFee);
+    }
+
+    // ==================== Internal: dripping ====================
+
+    function _dripAvailable(
+        PoolKey memory key,
+        PoolId poolId,
+        PoolAuctionConfig storage config,
+        PoolAuctionState storage state
+    ) internal returns (uint256 amountDonated) {
+        // both gates come from state slot 0 (already warm after _syncPool), so an idle
+        // configured pool pays no auction-struct or pending-bucket SLOADs at all
+        if (state.hasPending) {
+            amountDonated = _dripPending(key, poolId, config, state);
+        }
+        if (state.activeHasBid) {
+            amountDonated += _dripActiveEpoch(key, poolId, config, state);
+        }
+    }
+
+    /// @dev Releases the pending-donation bucket gradually rather than in one lump. donate()
+    ///      credits whoever is in range at that instant, so dumping the whole bucket at once
+    ///      lets a single-block JIT position capture all of it. Each release is throttled by
+    ///      minDripSeconds and bounded to (elapsed / epochLength) of pendingReleasePerEpoch - the
+    ///      largest single epoch's drip that fed the bucket - with the catch-up window capped at
+    ///      one epoch. The bound is deliberately NOT a fraction of the whole bucket: the bucket
+    ///      aggregates every carried epoch, so a fraction of it would hand a dust LP that appears
+    ///      after a long zero-liquidity stretch a slice that grows with the number of epochs
+    ///      carried. Pacing by one epoch's drip keeps the per-slice exposure identical to the
+    ///      active-epoch drip, whatever the aggregate; a bucket of N epochs takes ~N epochs to
+    ///      drain. Crucially, whenever the pool has no in-range liquidity the throttle clock is
+    ///      advanced, so an idle zero-liquidity stretch is NOT later paid out as one large
+    ///      catch-up slice to the first LP that reappears (which would be the sole in-range
+    ///      recipient of the whole accrued bucket). A JIT therefore has to hold liquidity for at
+    ///      least minDripSeconds to receive even one bounded slice. This bounds, but does not
+    ///      fully eliminate, point-in-time JIT exposure - a known tradeoff of donate-based
+    ///      distribution.
+    function _dripPending(
+        PoolKey memory key,
+        PoolId poolId,
+        PoolAuctionConfig storage config,
+        PoolAuctionState storage state
+    ) internal returns (uint256 amountToDonate) {
+        uint256 pending = state.pendingDonation;
+        if (pending == 0) {
+            return 0;
+        }
+
+        // Cannot donate without in-range liquidity; advance the clock so the gap cannot become a
+        // giant catch-up slice once liquidity returns.
+        if (StateLibrary.getLiquidity(poolManager, poolId) == 0) {
+            state.pendingLastDripTime = uint64(block.timestamp);
+            return 0;
+        }
+
+        uint64 last = state.pendingLastDripTime;
+        if (last != 0 && block.timestamp < uint256(last) + config.minDripSeconds) {
+            return 0;
+        }
+
+        uint256 elapsed = last == 0 ? config.minDripSeconds : block.timestamp - last;
+        if (elapsed > config.epochLengthSeconds) {
+            elapsed = config.epochLengthSeconds; // cap the catch-up at one epoch's worth
+        }
+        // Pace by the largest contributing epoch's drip, never by the aggregate. Round UP so
+        // every release moves at least one base unit - the bucket self-drains without a
+        // flush-on-zero branch, which for a small bucket against a long epoch (e.g. low-decimal
+        // currencies) would dump the whole bucket to the first LP.
+        uint256 pace = state.pendingReleasePerEpoch;
+        if (pace > pending) {
+            pace = pending; // legacy or dust bucket: never release faster than the old whole-bucket rule
+        }
+        uint256 release = FullMath.mulDivRoundingUp(pace, elapsed, config.epochLengthSeconds);
+        if (release > pending) {
+            release = pending;
+        }
+        if (release > MAX_BID_AMOUNT) {
+            release = MAX_BID_AMOUNT; // keep each donate within int128 range
+        }
+
+        amountToDonate = _donate(key, poolId, config, release);
+        if (amountToDonate == 0) {
+            // donate failed (e.g. broken auction currency): back off for minDripSeconds instead
+            // of re-attempting - and re-paying the failed transfer's gas - on every pool touch
+            state.pendingLastDripTime = uint64(block.timestamp);
+            return 0;
+        }
+        uint256 pendingRemaining = pending - amountToDonate;
+        state.pendingDonation = pendingRemaining;
+        if (pendingRemaining == 0) {
+            state.hasPending = false;
+            state.pendingReleasePerEpoch = 0;
+        }
+        state.pendingLastDripTime = uint64(block.timestamp);
+        emit PendingDonationDripped(poolId, amountToDonate, pendingRemaining);
+    }
+
+    function _dripActiveEpoch(
+        PoolKey memory key,
+        PoolId poolId,
+        PoolAuctionConfig storage config,
+        PoolAuctionState storage state
+    ) internal returns (uint256 amountToDonate) {
+        // caller gates on state.activeHasBid, so active.bid != 0 here
+        EpochAuction storage auction = state.active;
+
+        // Throttle FIRST: a throttled touch then pays only this slot's SLOAD - not the
+        // bid/totalDrip slot and not the PoolManager liquidity read. Vesting is computed from
+        // epochStart and `donated`, so returning early loses nothing; the zero-liquidity parking
+        // below is deferred by at most one throttle window, i.e. one bounded slice - exactly the
+        // granularity the anti-JIT throttle already accepts.
+        if (auction.lastDripTime != 0 && block.timestamp < uint256(auction.lastDripTime) + config.minDripSeconds) {
+            return 0;
+        }
+
+        uint64 epoch = state.activeEpoch;
+        // every caller runs _syncPool first, so epochStart <= block.timestamp < epochEnd holds
+        uint256 epochStart = uint256(config.epochStartTime) + uint256(epoch) * uint256(config.epochLengthSeconds);
+
+        _materializeEpoch(poolId, config, epoch, auction);
+
+        // totalDrip is nonzero after materializing a nonzero bid (protocol fee capped at 20%);
+        // the >= also safely covers the fully-donated epoch
+        uint128 totalDrip = auction.totalDrip;
+        if (auction.donated >= totalDrip) {
+            return 0;
+        }
+
+        uint256 vested = uint256(totalDrip) * (block.timestamp - epochStart) / config.epochLengthSeconds;
+        uint256 claimable = vested - auction.donated;
+        if (claimable == 0) {
+            return 0;
+        }
+
+        // No in-range liquidity: park the newly-vested slice into the pending bucket (anti-JIT
+        // gradual release) instead of letting it dump to the first LP that reappears, and mark
+        // it donated so it is not counted twice. Mirrors _dripPending's zero-liquidity handling.
+        if (StateLibrary.getLiquidity(poolManager, poolId) == 0) {
+            auction.donated += uint128(claimable);
+            _addPending(state, claimable, totalDrip);
+            return 0;
+        }
+
+        amountToDonate = _donate(key, poolId, config, claimable);
+        if (amountToDonate == 0) {
+            // donate failed (e.g. blacklisting auction currency): park the vested slice into the
+            // pending bucket, exactly like the zero-liquidity branch, and back off for
+            // minDripSeconds. Leaving it claimable instead would let it keep accruing across the
+            // whole outage and pay out in ONE lump - the entire epoch's drip so far - to whoever
+            // is in range the moment donates work again, i.e. to a JIT position that entered
+            // during the outage. Parked value recovers through _dripPending's paced release
+            // (one epoch's drip per epoch length, throttled), the same anti-JIT bound as a
+            // zero-liquidity gap. The active epoch keeps vesting from `donated`, so nothing is
+            // counted twice.
+            auction.donated += uint128(claimable);
+            auction.lastDripTime = uint64(block.timestamp);
+            _addPending(state, claimable, totalDrip);
+            return 0;
+        }
+
+        auction.donated += uint128(amountToDonate);
+        auction.lastDripTime = uint64(block.timestamp);
+        emit EpochDripped(poolId, epoch, amountToDonate, auction.donated);
+    }
+
+    /// @dev Donates `amount` of the auction currency to the pool's in-range liquidity.
+    ///      Returns 0 (keeping the value pending) while the pool has no active liquidity, and
+    ///      also returns 0 - without reverting - if the donate/settle leg reverts (e.g. a
+    ///      blacklisting or fee-on-transfer auction currency). Isolating the failure this way
+    ///      guarantees a misbehaving currency can neither brick pool swaps/liquidity ops nor
+    ///      void a winner's fee override; the undonated value simply stays pending.
+    function _donate(PoolKey memory key, PoolId poolId, PoolAuctionConfig storage config, uint256 amount)
+        internal
+        returns (uint256 amountToDonate)
+    {
+        if (amount == 0 || amount > MAX_BID_AMOUNT || StateLibrary.getLiquidity(poolManager, poolId) == 0) {
+            return 0;
+        }
+
+        // External self-call so a revert in donate/sync/transfer/settle is caught here and
+        // rolls back only this donation (the delta it created is undone with it).
+        try this.donateExternal(key, config.auctionCurrency, amount) {
+            amountToDonate = amount;
+        } catch {
+            emit DonateFailed(poolId, amount);
+            return 0;
+        }
+    }
+
+    /// @dev Self-only executor for a single donation, so `_donate` can wrap it in try/catch.
+    ///      Runs inside the same PoolManager unlock as the caller.
+    ///
+    ///      @custom:accepted-risk AUDIT-ACCEPTED-CONTROLLER-DRIP-SYNC
+    ///      The drip pays its donate debt with sync -> transfer -> settle INSIDE the integrator's
+    ///      unlock (reached from the hook's beforeSwap / beforeAddLiquidity / beforeRemoveLiquidity).
+    ///      PoolManager.sync records ONE synced currency plus its reserves in transient storage and
+    ///      settle() consumes and clears that record. A caller using the PRE-payment ordering
+    ///      `sync(X) -> transfer X -> swap/modifyLiquidity -> settle()` finds its record overwritten
+    ///      and cleared by the drip: its settle() then runs the native branch (paid = msg.value = 0),
+    ///      its X delta stays open and the unlock reverts CurrencyNotSettled. Failure mode: that
+    ///      caller's transaction reverts atomically - no funds move, nothing is stranded, and the
+    ///      pool is not blocked for anyone else (the drip is throttled per pool and memoized per
+    ///      transaction, so a retry with the standard ordering succeeds).
+    ///      Assumption accepted: integrators sync immediately before paying (the post-action
+    ///      ordering `swap -> sync -> transfer -> settle`, or ERC-6909 burn / native value), which is
+    ///      what every Uniswap router, the PositionManager and this hook's own actions do.
+    ///      Not restructured: donate() needs its delta settled within the same unlock, and paying it
+    ///      from ERC-6909 claims instead of sync/settle would require pre-minted claim inventory per
+    ///      auction currency - a larger surface than the documented constraint.
+    function donateExternal(PoolKey calldata key, Currency currency, uint256 amount) external {
+        if (msg.sender != address(this)) {
+            revert Unauthorized();
+        }
+        bool isCurrency0 = currency == key.currency0;
+        poolManager.donate(key, isCurrency0 ? amount : 0, isCurrency0 ? 0 : amount, "");
+
+        // Deliberately NOT CurrencySettler.settle: it discards PoolManager's credited amount.
+        // If the auction currency takes a transfer fee, the PoolManager receives less than
+        // `amount` and the donate's debt stays partially unsettled - without this check the
+        // self-call would return success, _donate's catch would not fire, and the outer unlock
+        // would revert CurrencyNotSettled outside the isolation, blocking the pool's swaps and
+        // liquidity ops whenever a drip is attempted. Reverting here instead rolls the whole
+        // donation back through the existing catch (DonateFailed + retry back-off).
+        poolManager.sync(currency);
+        IERC20 token = IERC20(Currency.unwrap(currency));
+        uint256 balanceBefore = token.balanceOf(address(this));
+        token.safeTransfer(address(poolManager), amount);
+        if (poolManager.settle() != amount) {
+            revert ExactTransferFailed();
+        }
+        // Also verify OUR debit: a sender-side surcharge (controller debited amount + fee while
+        // the PoolManager is credited exactly amount) would pass the settle check but silently
+        // consume funds backing refunds and protocol fees, making the controller insolvent.
+        if (balanceBefore - token.balanceOf(address(this)) != amount) {
+            revert ExactTransferFailed();
+        }
+    }
+}

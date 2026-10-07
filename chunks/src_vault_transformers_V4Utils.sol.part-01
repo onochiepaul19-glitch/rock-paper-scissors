@@ -1,0 +1,299 @@
+ver tokens to recipient. The swapSourceToken can be token0, token1, or a third token.
+    /// @param params Swap and increase liquidity configuration containing tokenId, amounts, swap parameters, and recipient
+    /// @return liquidity The amount of liquidity added to the position
+    /// @return amount0 The amount of token0 actually added to the position
+    /// @return amount1 The amount of token1 actually added to the position
+    function swapAndIncreaseLiquidity(SwapAndIncreaseLiquidityParams memory params)
+        external
+        payable
+        returns (uint128 liquidity, uint256 amount0, uint256 amount1)
+    {
+        // Only the position owner (direct or via vault transform) may operate on the position.
+        // Without this, anyone could call this on a position that granted V4Utils a standing
+        // approval, collect its fees, and redirect leftovers to an arbitrary recipient (H-1).
+        _validateCaller(positionManager, params.tokenId);
+        // an increase replaces nothing: a remint claim has no token this caller is draining
+        _checkRemintClaim(params.increaseLiquidityHookData, 0);
+
+        if (executing) {
+            revert Reentrancy();
+        }
+        executing = true;
+
+        // first fees must be removed
+        (uint256 fees0, uint256 fees1) =
+            _decreaseLiquidity(params.tokenId, 0, 0, 0, params.deadline, params.decreaseLiquidityHookData);
+
+        // Get position info from V4 PositionManager
+        (PoolKey memory poolKey,) = positionManager.getPoolAndPositionInfo(params.tokenId);
+
+        _prepareAddApproved(
+            poolKey.currency0,
+            poolKey.currency1,
+            params.swapSourceToken,
+            params.amount0,
+            params.amount1,
+            params.amountIn0 + params.amountIn1
+        );
+
+        // if native token special handling - see _decreaseLiquidity()
+        params.amount0 = params.amount0 + fees0;
+        params.amount1 = params.amount1 + fees1;
+
+        (liquidity, amount0, amount1) = _swapAndIncrease(params, poolKey.currency0, poolKey.currency1);
+
+        executing = false;
+    }
+
+    // Internal helper functions
+
+    /// @dev Refuses a tagged remint claim unless it names `allowedOldTokenId` (0: no claim allowed). The hook
+    ///      only checks that the locker is approved on the old token, and this contract is the locker for
+    ///      every caller: without this, anyone could claim the automation of a drained position whose owner
+    ///      once approved this contract (a normal post-range-change state) through the permissionless mint
+    ///      (V4LE-9). Untagged hookData is passed through untouched.
+    function _checkRemintClaim(bytes memory hookData, uint256 allowedOldTokenId) internal pure {
+        if (hookData.length != 36 || bytes4(hookData) != REMINT_MIGRATION_TAG) {
+            return;
+        }
+        uint256 claimed;
+        assembly ("memory-safe") {
+            claimed := mload(add(hookData, 36))
+        }
+        if (allowedOldTokenId == 0 || claimed != allowedOldTokenId) {
+            revert Unauthorized();
+        }
+    }
+
+    function _prepareAddApproved(
+        Currency token0,
+        Currency token1,
+        Currency otherToken,
+        uint256 amount0,
+        uint256 amount1,
+        uint256 amountOther
+    ) internal {
+        // Process each token
+        _prepareAddApprovedToken(token0, amount0);
+        _prepareAddApprovedToken(token1, amount1);
+        if (!(otherToken == token0) && !(otherToken == token1)) {
+            _prepareAddApprovedToken(otherToken, amountOther);
+        }
+        // if msg.value > 0, then one of the tokens must be ether with amount > 0
+        if (
+            msg.value > 0 && !(token0.isAddressZero() && amount0 > 0) && !(token1.isAddressZero() && amount1 > 0)
+                && !(otherToken.isAddressZero() && amountOther > 0)
+        ) {
+            revert NoEtherToken();
+        }
+    }
+
+    function _prepareAddApprovedToken(Currency token, uint256 amount) internal {
+        if (amount == 0) return;
+
+        if (!token.isAddressZero()) {
+            SafeERC20.safeTransferFrom(IERC20(Currency.unwrap(token)), msg.sender, address(this), amount);
+        } else {
+            if (msg.value != amount) {
+                revert IncorrectNativeBalance();
+            }
+        }
+    }
+
+    // swap and mint logic
+    function _swapAndMint(SwapAndMintParams memory params)
+        internal
+        returns (uint256 tokenId, uint128 liquidity, uint256 added0, uint256 added1)
+    {
+        (uint256 total0, uint256 total1) = _swapAndPrepareAmounts(params);
+
+        // V4 uses different approach - need to create PoolKey and use modifyLiquidities
+        PoolKey memory poolKey = PoolKey({
+            currency0: params.token0,
+            currency1: params.token1,
+            fee: params.fee,
+            tickSpacing: params.tickSpacing, // Use dynamic tickSpacing from params
+            hooks: IHooks(params.hook) // Use hook from params
+        });
+
+        (tokenId, liquidity) = _mintPosition(poolKey, params, total0, total1);
+
+        // Transfer NFT to recipient (with optional return data)
+        // @custom:accepted-risk AUDIT-ACCEPTED-SAFE-TRANSFER-BEFORE-REFUND
+        // The ERC721 callback happens before leftover accounting. These public helpers
+        // intentionally use whole-balance accounting and are expected to finish empty.
+        IERC721(address(positionManager))
+            .safeTransferFrom(address(this), params.recipientNFT, tokenId, params.returnData);
+
+        // Whole-balance accounting is intentional here: these helpers are expected to end each
+        // successful call with no retained token balances, so final balances represent the
+        // complete leftover amounts to return to the caller.
+        // Calculate consumption and return leftovers
+        uint256 finalBalance0 = poolKey.currency0.balanceOfSelf();
+        uint256 finalBalance1 = poolKey.currency1.balanceOfSelf();
+
+        // Calculate amounts actually added
+        added0 = total0 - finalBalance0;
+        added1 = total1 - finalBalance1;
+
+        // Check minimum amounts were added
+        if (added0 < params.amountAddMin0) {
+            revert InsufficientAmountAdded();
+        }
+        if (added1 < params.amountAddMin1) {
+            revert InsufficientAmountAdded();
+        }
+
+        emit SwapAndMint(tokenId, liquidity, added0, added1);
+
+        // Return leftover tokens
+        if (finalBalance0 > 0) {
+            params.token0.transfer(params.recipient, finalBalance0);
+        }
+        if (finalBalance1 > 0) {
+            params.token1.transfer(params.recipient, finalBalance1);
+        }
+    }
+
+    /// @notice Mints a new position with the specified parameters
+    /// @param poolKey The pool key for the position
+    /// @param params The parameters for the minting
+    /// @param total0 The amount of token0 to add
+    /// @param total1 The amount of token1 to add
+    /// @return tokenId The ID of the newly minted position
+    /// @return liquidity The amount of liquidity added
+    function _mintPosition(PoolKey memory poolKey, SwapAndMintParams memory params, uint256 total0, uint256 total1)
+        internal
+        returns (uint256 tokenId, uint128 liquidity)
+    {
+        (bytes memory actions, bytes[] memory paramsArray) =
+            _buildActionsForIncreasingLiquidity(uint8(Actions.MINT_POSITION), params.token0, params.token1);
+
+        // Calculate liquidity from amounts
+        liquidity = _calculateLiquidity(params.tickLower, params.tickUpper, poolKey, total0, total1);
+
+        paramsArray[0] = abi.encode(
+            poolKey,
+            params.tickLower,
+            params.tickUpper,
+            liquidity, // liquidity
+            total0, // amount0Max
+            total1, // amount1Max
+            address(this), // recipient
+            params.mintHookData // hookData
+        );
+
+        positionManager.modifyLiquidities{value: NativeAssetLib.balanceIfNative(params.token0, params.token1)}(
+            abi.encode(actions, paramsArray), params.deadline
+        );
+
+        // Get the newly minted token ID
+        tokenId = positionManager.nextTokenId() - 1;
+    }
+
+    // swap and increase logic
+    // this method needs that fees are already removed from the position
+    function _swapAndIncrease(SwapAndIncreaseLiquidityParams memory params, Currency token0, Currency token1)
+        internal
+        returns (uint128 liquidity, uint256 added0, uint256 added1)
+    {
+        SwapAndMintParams memory swapParams = _buildSwapAndMintParamsForIncrease(params, token0, token1);
+        (uint256 total0, uint256 total1) = _swapAndPrepareAmounts(swapParams);
+
+        // Get position info to determine currencies for TAKE_PAIR
+        (PoolKey memory poolKey, PositionInfo info) = positionManager.getPoolAndPositionInfo(params.tokenId);
+
+        // Build actions for native ETH if needed
+        (bytes memory actions, bytes[] memory paramsArray) =
+            _buildActionsForIncreasingLiquidity(uint8(Actions.INCREASE_LIQUIDITY), poolKey.currency0, poolKey.currency1);
+
+        // Calculate liquidity from amounts
+        liquidity = _calculateLiquidity(info.tickLower(), info.tickUpper(), poolKey, total0, total1);
+
+        paramsArray[0] = abi.encode(params.tokenId, liquidity, total0, total1, params.increaseLiquidityHookData);
+
+        positionManager.modifyLiquidities{value: NativeAssetLib.balanceIfNative(poolKey.currency0, poolKey.currency1)}(
+            abi.encode(actions, paramsArray), params.deadline
+        );
+
+        // Whole-balance accounting is intentional here: these helpers are expected to end each
+        // successful call with no retained token balances, so final balances represent the
+        // complete leftover amounts to return to the caller.
+        // Calculate consumption and return leftovers
+        {
+            uint256 finalBalance0 = poolKey.currency0.balanceOfSelf();
+            uint256 finalBalance1 = poolKey.currency1.balanceOfSelf();
+
+            // Calculate amounts actually added
+            added0 = total0 - finalBalance0;
+            added1 = total1 - finalBalance1;
+
+            // Check minimum amounts were added
+            if (added0 < params.amountAddMin0) {
+                revert InsufficientAmountAdded();
+            }
+            if (added1 < params.amountAddMin1) {
+                revert InsufficientAmountAdded();
+            }
+
+            emit SwapAndIncreaseLiquidity(params.tokenId, liquidity, added0, added1);
+
+            // Return leftover tokens
+            if (finalBalance0 > 0) {
+                token0.transfer(params.recipient, finalBalance0);
+            }
+            if (finalBalance1 > 0) {
+                token1.transfer(params.recipient, finalBalance1);
+            }
+        }
+    }
+
+    // swaps available tokens and prepares max amounts to be added to positionManager
+    function _swapAndPrepareAmounts(SwapAndMintParams memory params) internal returns (uint256 total0, uint256 total1) {
+        Currency swapSource = params.swapSourceToken;
+        if (swapSource == params.token0) {
+            if (params.amount0 < params.amountIn1) {
+                revert AmountError();
+            }
+            _routerSwap(
+                Swapper.RouterSwapParams(
+                    params.token0, params.token1, params.amountIn1, params.amountOut1Min, params.swapData1
+                )
+            );
+        } else if (swapSource == params.token1) {
+            if (params.amount1 < params.amountIn0) {
+                revert AmountError();
+            }
+
+            _routerSwap(
+                Swapper.RouterSwapParams(
+                    params.token1, params.token0, params.amountIn0, params.amountOut0Min, params.swapData0
+                )
+            );
+        } else {
+            (uint256 amountInDelta0,) = _routerSwap(
+                Swapper.RouterSwapParams(
+                    swapSource, params.token0, params.amountIn0, params.amountOut0Min, params.swapData0
+                )
+            );
+            (uint256 amountInDelta1,) = _routerSwap(
+                Swapper.RouterSwapParams(
+                    swapSource, params.token1, params.amountIn1, params.amountOut1Min, params.swapData1
+                )
+            );
+
+            // return third token leftover if any
+            uint256 leftOver = params.amountIn0 + params.amountIn1 - amountInDelta0 - amountInDelta1;
+
+            if (leftOver > 0) {
+                swapSource.transfer(params.recipient, leftOver);
+            }
+        }
+
+        total0 = params.token0.balanceOfSelf();
+        total1 = params.token1.balanceOfSelf();
+
+        _handleApproval(permit2, params.token0, total0);
+        _handleApproval(permit2, params.token1, total1);
+    }
+}

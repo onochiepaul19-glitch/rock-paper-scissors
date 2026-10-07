@@ -1,0 +1,74 @@
+int128).max,
+            type(uint128).max,
+            address(this),
+            params.mintHookData
+        );
+
+        positionManager.modifyLiquidities{value: NativeAssetLib.balanceIfNative(params.token0, params.token1)}(
+            abi.encode(actions, mintParams), params.deadline
+        );
+
+        // Get the newly minted token ID
+        newTokenId = positionManager.nextTokenId() - 1;
+    }
+
+    /// @dev Helper function to finalize the leverage in operation
+    function _finalizeLeverageIn(
+        LeverageInTransformParams calldata params,
+        uint256 amount0,
+        uint256 amount1,
+        uint256 newTokenId
+    ) internal {
+        // Whole-balance accounting is intentional here: the transformer is expected to finish
+        // successful executions without retaining position tokens, so the remaining balances are
+        // treated as the full leftovers owed back to the recipient.
+        // Calculate amounts added; saturate so unsolicited dust in a token this operation did
+        // not consume cannot revert the whole leverage-in (see _leverageUpFinalize)
+        uint256 balance0 = params.token0.balanceOfSelf();
+        uint256 balance1 = params.token1.balanceOfSelf();
+        uint256 added0 = amount0 > balance0 ? amount0 - balance0 : 0;
+        uint256 added1 = amount1 > balance1 ? amount1 - balance1 : 0;
+
+        // Check minimum amounts were added
+        if (added0 < params.amountAddMin0) {
+            revert InsufficientAmountAdded();
+        }
+        if (added1 < params.amountAddMin1) {
+            revert InsufficientAmountAdded();
+        }
+
+        // Send the new position to the vault - this will replace the dummy position
+        // The vault's onERC721Received will handle replacing the old position with the new one
+        IERC721(address(positionManager)).safeTransferFrom(address(this), msg.sender, newTokenId);
+
+        // Send leftover tokens to recipient (the lend currency is always one of token0 or token1)
+        uint256 leftover0 = params.token0.balanceOfSelf();
+        uint256 leftover1 = params.token1.balanceOfSelf();
+
+        if (leftover0 > 0) {
+            params.token0.transfer(params.recipient, leftover0);
+        }
+        if (leftover1 > 0) {
+            params.token1.transfer(params.recipient, leftover1);
+        }
+    }
+
+    /// @dev Every entry point of this transformer treats `msg.sender` as the vault it borrows from or
+    ///      repays to, so only a registered vault inside its transform of `tokenId` may call them. The
+    ///      generic `_validateCaller` also admits the NFT owner, which for these entries would let any
+    ///      contract holding a PositionManager NFT pose as the vault (a no-op `borrow`, an arbitrary
+    ///      `asset`) and have the transformer drain the NFT plus any balance it holds to a recipient of
+    ///      the caller's choosing (V4LE-117).
+    function _validateVaultCaller(uint256 tokenId) internal view {
+        if (!vaults[msg.sender]) {
+            revert Unauthorized();
+        }
+        _validateCaller(positionManager, tokenId);
+    }
+
+    /// @notice Callback for receiving ERC721 tokens
+    /// @dev Required for receiving NFTs from the position manager
+    function onERC721Received(address, address, uint256, bytes calldata) external pure override returns (bytes4) {
+        return IERC721Receiver.onERC721Received.selector;
+    }
+}

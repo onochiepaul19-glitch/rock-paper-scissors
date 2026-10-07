@@ -1,0 +1,154 @@
+ c / |b| - it divided by
+    ///      zero and returned the current price, i.e. no swap although token1 was in surplus
+    ///      (external audit V4LE-150). Every case where no positive root exists (no real root,
+    ///      or the sign of a / c puts the root at or below zero) returns `noRoot`, the current
+    ///      price, which the callers treat as no swap; the callers clamp the result to their side
+    ///      of the current price and to the requested range.
+    /// @param noRoot Returned when the equation has no positive root
+    /// @return root The positive root in Q96, or `noRoot`
+    function _positiveQuadraticRoot(uint256 a2, uint256 b, uint256 c2, uint256 noRoot)
+        private
+        pure
+        returns (uint256 root)
+    {
+        (bool realRoot, uint256 sqrtDiscriminant) = _sqrtDiscriminant(a2, b, c2);
+        if (!realRoot) return noRoot;
+        if (int256(b) >= 0) {
+            // (b + sqrt(D)) / (2a): positive only for a > 0 (a == 0 leaves -b*p - c == 0, whose
+            // root is -c/b: at or below zero for c >= 0, and the callers exclude c < 0 with b >= 0
+            // from a swap by the range clamp anyway)
+            if (int256(a2) <= 0) return noRoot;
+            // b <= 2^128 - 1 and sqrt(D) < 2^128 (checked in _sqrtDiscriminant): no overflow
+            root = FullMath.mulDiv(sqrtDiscriminant + b, FixedPoint96.Q96, a2);
+        } else {
+            // 2c / (sqrt(D) + |b|): positive only for c > 0; covers a == 0 (root c / |b|) and
+            // the 1->0 solver's negative `a` (the smaller positive root, as before)
+            if (int256(c2) <= 0) return noRoot;
+            root = FullMath.mulDiv(c2, FixedPoint96.Q96, sqrtDiscriminant + _abs(b));
+        }
+        if (root == 0) return noRoot;
+    }
+
+    /// @notice Square root of the analytic solvers' quadratic discriminant b*b + a*c
+    /// @dev The coefficients are two's-complement words: `b` may be negative in both solvers, `a`
+    ///      in the 1->0 solver (whose root is taken with sdiv) and `c` in the 0->1 solver (the
+    ///      unguarded fee-band case documented at M-5), so the products are formed on magnitudes
+    ///      and recombined by sign. Everything used to be computed unchecked (external audit
+    ///      V4LE-33): for large valid coefficients b*b wrapped modulo 2^256 and the solver returned
+    ///      a plausible-looking but wrong plan (a final price outside the requested range). A
+    ///      magnitude that does not fit 256 bits now reverts Math_Overflow. A negative discriminant
+    ///      has no real root; the solvers then keep the current price (no swap), the degradation the
+    ///      M-5 note documents for that extreme.
+    /// @return realRoot False when the discriminant is negative
+    /// @return root sqrt(b*b + a*c) when realRoot
+    function _sqrtDiscriminant(uint256 a, uint256 b, uint256 c) private pure returns (bool realRoot, uint256 root) {
+        unchecked {
+            uint256 absB = _abs(b);
+            // (2^128 - 1)^2 < 2^256 <= (2^128)^2
+            if (absB > type(uint128).max) revert Math_Overflow();
+            uint256 bb = absB * absB;
+            uint256 absA = _abs(a);
+            uint256 absC = _abs(c);
+            uint256 ac = absA * absC;
+            if (absA != 0 && ac / absA != absC) revert Math_Overflow();
+            if (ac != 0 && (int256(a) < 0) != (int256(c) < 0)) {
+                if (ac > bb) return (false, 0);
+                return (true, Math.sqrt(bb - ac));
+            }
+            uint256 disc = bb + ac;
+            if (disc < bb) revert Math_Overflow();
+            return (true, Math.sqrt(disc));
+        }
+    }
+
+    /// @dev Magnitude of a two's-complement word
+    function _abs(uint256 x) private pure returns (uint256) {
+        unchecked {
+            return int256(x) < 0 ? 0 - x : x;
+        }
+    }
+
+    /// @notice Determine swap direction when price is within range
+    /// @dev Token0 is in surplus when it funds more liquidity for the range than token1 does:
+    ///        L0 = amount0 * sqrtPrice * sqrtUpper / (Q96 * (sqrtUpper - sqrtPrice))
+    ///        L1 = amount1 * Q96 / (sqrtPrice - sqrtLower)
+    ///      Both are formed so that no intermediate floors to zero: the price-only factor
+    ///      sqrtPrice * sqrtUpper / (sqrtUpper - sqrtPrice) is at least sqrtPrice (>= 2^32), so
+    ///      it keeps 32 bits of precision, and the amounts are multiplied in before the single
+    ///      division by Q96. The previous form floored amount0 * sqrtPrice / Q96 first, which is
+    ///      zero for any amount0 below Q96 / sqrtPrice (~1.8e19 wei at the sqrt prices near
+    ///      MIN_TICK), so a pure token0 holding compared as an empty one and the planner chose
+    ///      1->0 with nothing to swap (external audit V4LE-146). A product that does not fit
+    ///      256 bits saturates: liquidity that large cannot be minted anyway, and the comparison
+    ///      only needs the ordering.
+    /// @param amount0Target Desired amount of token0
+    /// @param amount1Target Desired amount of token1
+    /// @param sqrtPrice Current sqrt price, strictly inside (sqrtLower, sqrtUpper)
+    /// @param sqrtLower Lower bound sqrt price
+    /// @param sqrtUpper Upper bound sqrt price
+    /// @return true if should swap token0->token1, false otherwise
+    function _checkSwapDirectionInRange(
+        uint256 amount0Target,
+        uint256 amount1Target,
+        uint256 sqrtPrice,
+        uint256 sqrtLower,
+        uint256 sqrtUpper
+    ) private pure returns (bool) {
+        unchecked {
+            uint256 liquidity0 = _mulDivSaturating(
+                amount0Target, _mulDivSaturating(sqrtPrice, sqrtUpper, sqrtUpper - sqrtPrice), FixedPoint96.Q96
+            );
+            uint256 liquidity1 = _mulDivSaturating(amount1Target, FixedPoint96.Q96, sqrtPrice - sqrtLower);
+            return liquidity0 > liquidity1;
+        }
+    }
+
+    /// @dev floor(a * b / denominator), or type(uint256).max when the result does not fit
+    function _mulDivSaturating(uint256 a, uint256 b, uint256 denominator) private pure returns (uint256) {
+        uint256 prod1;
+        assembly ("memory-safe") {
+            let mm := mulmod(a, b, not(0))
+            let prod0 := mul(a, b)
+            prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+        }
+        if (prod1 >= denominator) return type(uint256).max;
+        return FullMath.mulDiv(a, b, denominator);
+    }
+
+    /// @inheritdoc ILiquidityCalculator
+    function swapDirection(uint160 sqrtPriceX96, int24 tickLower, int24 tickUpper, uint256 amount0, uint256 amount1)
+        external
+        pure
+        returns (bool zeroForOne)
+    {
+        if (tickLower >= tickUpper || tickLower < TickMath.MIN_TICK || tickUpper > TickMath.MAX_TICK) {
+            revert Invalid_Tick_Range();
+        }
+        return _shouldSwap0to1(
+            amount0, amount1, sqrtPriceX96, TickMath.getSqrtPriceAtTick(tickLower), TickMath.getSqrtPriceAtTick(tickUpper)
+        );
+    }
+
+    /// @notice Determine optimal swap direction for double-sided deposit
+    /// @dev Returns true if should swap token0->token1, false for token1->token0
+    /// @param amount0Target Desired amount of token0
+    /// @param amount1Target Desired amount of token1
+    /// @param sqrtPrice Current sqrt price
+    /// @param sqrtLower Lower bound sqrt price
+    /// @param sqrtUpper Upper bound sqrt price
+    /// @return true if should swap token0->token1, false otherwise
+    function _shouldSwap0to1(
+        uint256 amount0Target,
+        uint256 amount1Target,
+        uint256 sqrtPrice,
+        uint256 sqrtLower,
+        uint256 sqrtUpper
+    ) private pure returns (bool) {
+        // If price is below range, only need token0 (swap token1->token0)
+        if (sqrtPrice <= sqrtLower) return false;
+        // If price is above range, only need token1 (swap token0->token1)
+        else if (sqrtPrice >= sqrtUpper) return true;
+        // If price is in range, compare liquidity requirements
+        else return _checkSwapDirectionInRange(amount0Target, amount1Target, sqrtPrice, sqrtLower, sqrtUpper);
+    }
+}

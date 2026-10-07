@@ -1,0 +1,123 @@
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity ^0.8.30;
+
+import {BaseHook} from "@openzeppelin/uniswap-hooks/src/base/BaseHook.sol";
+
+import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+
+import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
+import {NativeWrapper} from "@uniswap/v4-periphery/src/base/NativeWrapper.sol";
+import {IWETH9} from "@uniswap/v4-periphery/src/interfaces/external/IWETH9.sol";
+
+import {IV4Oracle} from "../oracle/interfaces/IV4Oracle.sol";
+import {IHookFeeController} from "./interfaces/IHookFeeController.sol";
+import {IHookAuctionController} from "./interfaces/IHookAuctionController.sol";
+import {RevertHookAutoLendActions} from "./RevertHookAutoLendActions.sol";
+import {RevertHookMigrationActions} from "./RevertHookMigrationActions.sol";
+import {RevertHookAutoLeverageActions} from "./RevertHookAutoLeverageActions.sol";
+import {RevertHookPositionActions} from "./RevertHookPositionActions.sol";
+import {RevertHookLookupBase} from "./RevertHookLookupBase.sol";
+
+/// @title RevertHookBase
+/// @notice Hook-only shared base for constructor wiring, common lookups, and delegatecall helpers
+abstract contract RevertHookBase is RevertHookLookupBase, BaseHook, IUnlockCallback {
+    /// @dev Public so the fee controller can refuse the PositionManager as fee recipient (its
+    ///      permissionless SWEEP would let anyone take fees parked there).
+    IPositionManager public immutable positionManager;
+    IWETH9 internal immutable weth;
+    IV4Oracle internal immutable v4Oracle;
+    IHookFeeController internal immutable hookFeeController;
+
+    IHookAuctionController internal immutable hookAuctionController;
+
+    RevertHookPositionActions internal immutable positionActions;
+    RevertHookAutoLeverageActions internal immutable autoLeverageActions;
+    RevertHookAutoLendActions internal immutable autoLendActions;
+    RevertHookMigrationActions internal immutable migrationActions;
+
+    constructor(
+        address owner_,
+        IV4Oracle _v4Oracle,
+        IHookFeeController _hookFeeController,
+        IHookAuctionController _hookAuctionController,
+        RevertHookPositionActions _positionActions,
+        RevertHookAutoLeverageActions _autoLeverageActions,
+        RevertHookAutoLendActions _autoLendActions,
+        RevertHookMigrationActions _migrationActions
+    ) BaseHook(_v4Oracle.poolManager()) {
+        if (owner_ == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+
+        _transferOwnership(owner_);
+
+        IPositionManager positionManager_ = _v4Oracle.positionManager();
+        positionManager = positionManager_;
+        weth = NativeWrapper(payable(address(positionManager_))).WETH9();
+        v4Oracle = _v4Oracle;
+        hookFeeController = _hookFeeController;
+        hookAuctionController = _hookAuctionController;
+        positionActions = _positionActions;
+        autoLeverageActions = _autoLeverageActions;
+        autoLendActions = _autoLendActions;
+        migrationActions = _migrationActions;
+    }
+
+    function transferOwnership(address newOwner) external payable onlyOwner {
+        if (newOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(newOwner);
+    }
+
+    function renounceOwnership() external payable onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    function setVault(address vault) external payable onlyOwner {
+        _setVault(vault);
+    }
+
+    receive() external payable {}
+
+    function _positionManagerRef() internal view override returns (IPositionManager) {
+        return positionManager;
+    }
+
+    function _poolManagerRef() internal view override returns (IPoolManager) {
+        return poolManager;
+    }
+
+    function _getPositionValueNative(uint256 tokenId) internal view returns (uint256 value) {
+        (value,,,) = v4Oracle.getValue(tokenId, address(0));
+    }
+
+    /// @dev Delegatecalls a sidecar, bubbling its revert data; returns the raw return data so
+    ///      callers that need a result can decode it without duplicating this routine.
+    function _delegatecallPassthrough(address target, bytes memory data) internal returns (bytes memory returndata) {
+        bool success;
+        (success, returndata) = target.delegatecall(data);
+        if (!success) {
+            assembly ("memory-safe") {
+                revert(add(returndata, 0x20), mload(returndata))
+            }
+        }
+    }
+
+    function _tryDelegatecall(address target, bytes memory data) internal returns (bool success) {
+        (success,) = target.delegatecall(data);
+    }
+
+    function _delegatecallPositionActionsPassthrough(bytes memory data) internal {
+        _delegatecallPassthrough(address(positionActions), data);
+    }
+
+    function _delegatecallAutoLeverageActionsPassthrough(bytes memory data) internal {
+        _delegatecallPassthrough(address(autoLeverageActions), data);
+    }
+
+    function _tryDelegatecallPositionActions(bytes memory data) internal returns (bool success) {
+        return _tryDelegatecall(address(positionActions), data);
+    }
+}

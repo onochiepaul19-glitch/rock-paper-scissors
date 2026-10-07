@@ -1,0 +1,393 @@
+# Audit Handoff
+
+This document is a concise protocol handoff for external auditors reviewing `v4lend`.
+
+PR #40 follow-up: [audit-followup-fixes.md](audit-followup-fixes.md) records the new implementation
+and [audit-deferred-findings.md](audit-deferred-findings.md) records remaining operational/policy items.
+
+Target snapshot:
+- commit: re-pin at merge of `fix/audit-readiness-2026-09` (findings from `docs/audit-readiness-review.md` fixed on that branch)
+- branch: `main`
+
+Validation at this snapshot:
+- `forge test`
+- `forge build --sizes`
+
+Both were green at handoff time.
+
+## Scope
+
+Primary audit scope is first-party Solidity under [`src/`](/Users/kalinbas/Code/v4lend/src).
+
+Main protocol components:
+- [`src/vault/V4Vault.sol`](/Users/kalinbas/Code/v4lend/src/vault/V4Vault.sol)
+- [`src/oracle/V4Oracle.sol`](/Users/kalinbas/Code/v4lend/src/oracle/V4Oracle.sol)
+- [`src/RevertHook.sol`](/Users/kalinbas/Code/v4lend/src/RevertHook.sol) and [`src/hook/`](/Users/kalinbas/Code/v4lend/src/hook)
+- [`src/automators/`](/Users/kalinbas/Code/v4lend/src/automators)
+- [`src/vault/transformers/`](/Users/kalinbas/Code/v4lend/src/vault/transformers)
+- shared math / planning / swap helpers under [`src/shared/`](/Users/kalinbas/Code/v4lend/src/shared)
+
+Supporting tests, scripts, and docs are meant as context, not as primary protocol scope.
+
+## System Summary
+
+`v4lend` is a Uniswap v4-native lending and automation system built around LP NFTs.
+
+The system supports:
+- using Uniswap v4 LP NFTs as collateral in a single-asset ERC4626 vault
+- valuing LP positions with Chainlink-backed oracle checks
+- swap-triggered automation through a v4 hook
+- operator-driven standalone automators
+- vault-managed transforms for compounding, range changes, and leverage flows
+
+High-level modules:
+- `V4Vault`: lenders deposit one asset; borrowers post LP NFTs as collateral and borrow the vault asset
+- `V4Oracle`: values LP collateral and fees in a common reference asset
+- `RevertHook`: on-swap automation for LP positions
+- automators: operator-driven one-shot execution contracts
+- transformers: helpers used directly or via `V4Vault.transform(...)`
+
+## Actors And Trust Model
+
+Privileged actors:
+- vault owner
+- hook owner
+- protocol owner / deployment owner in scripts
+- approved automator operators
+- approved vault transformers
+
+User actors:
+- LP/NFT owners
+- lenders
+- borrowers
+- liquidators
+
+External dependencies:
+- Uniswap v4 `PoolManager`
+- Uniswap v4 `PositionManager`
+- Chainlink-style feeds
+- ERC4626 vaults for auto-lend
+- swap routers / calldata targets used by automators and transformers
+
+Important trust assumptions:
+- oracle token configs are correct and maintained
+- hook fee and route controllers are configured by the intended hook owner
+- automator operators are trusted to submit the intended quoted execution calldata
+- approved transformers are trusted as part of the vault’s privileged surface
+
+## Main Contracts
+
+### V4Vault
+
+File:
+- [`src/vault/V4Vault.sol`](/Users/kalinbas/Code/v4lend/src/vault/V4Vault.sol)
+
+Purpose:
+- ERC4626 vault for one lend/borrow asset
+- LP NFT collateral management
+- borrow / repay / liquidate
+- reserve accounting
+- transform orchestration
+
+Notes:
+- `V4Vault` intentionally holds lender funds, reserves, and collateral NFTs
+- unlike automators and hook helpers, it is not expected to end operations with zero balances
+- `liquidate` refuses the loan owner as caller and as collateral recipient: the reserve-backed liquidation branch subsidizes an independent liquidator, and a borrower must not collect that subsidy on their own loan (a second address stays possible; the check closes the direct and flash-helper paths)
+- a liquidation whose uncovered reserve cost is socialized (lend exchange rate written down) also caps the same-day lend allowance (`dailyLendIncreaseLimitLeft`) at what a fresh day would grant on the surviving lender claims, so a later deposit cannot consume an allowance sized on erased claims
+- every supply-relative bound (the per-token debt concentration cap in `_checkTokenDebtLimit` and the daily debt quota from `_calculateDailyLimit`) is sized on `_settledLentAssets`: the lent assets net of `dailyLendNetInflow`, the deposits minus withdrawals recorded since the last daily lend reset. A deposit widens those bounds from the next UTC day on, a withdrawal of settled supply shrinks them at once, so a same-day deposit-borrow-withdraw sequence cannot inflate the supply the bounds are measured against (Scan #2 V4LE-122 / V4LE-127); the absolute `tokenDebtLimits` budget is unchanged
+- `repay` on a debt-free loan or an unknown token is a pure no-op (returns `(0, 0)`, no event) and in particular does not refresh the daily debt quota; only a repayment that moves debt shares does, so a zero-value call cannot pin the day's quota on a still unfunded lender pool
+- `transferLoan` moves the former owner's transform approval for the position's own allowlisted pool hook to the new owner (and clears it on the former owner): hook automation is token-id keyed and stays armed across the transfer, so without the approval every hook transform would fail and consume the trigger; the new owner can revoke it with `approveTransform`. Approvals for other targets (operators of the former owner) are not carried and stop working with the transfer
+- a liquidation is always total and settles in the one fee-first unlock every removal uses (INCREASE(0), DECREASE, TAKE_PAIR). v4 narrows the principal of every decrease, every fee amount and every take to int128, and a position cannot pay out more of a currency than exists: the oracle therefore accepts only tokens whose total supply is below 2^127 (`V4Oracle._requireBoundedSupply`, in the constructor for the reference token and in `setTokenConfig`), which makes v4's limit unreachable for any accepted position at any price and any liquidity, with no per-position check and nothing that can drift after admission. A token minting past the bound after configuration is a token failure outside the trust model, like any other supply attack on its price (Scan #2 V4LE-98 / V4LE-156)
+- liquidation proceeds are collected to the vault and split there: the liquidator receives at most `liquidationValue` worth at the oracle's own token prices (the removal settles at the live pool price, up to `maxPoolPriceDifference` off the oracle, so the actual delta can exceed the quote); any excess goes to the loan owner, a shortfall (hook skim, pool below oracle) is the liquidator's, and native ETH remainders are wrapped. A remainder the owner cannot receive (ERC20 blocklist, reverting transfer) is moved to the vault-owned `LiquidationEscrow` and credited to the owner, who claims it to any recipient with `claim`; it never goes to the liquidator and never blocks the liquidation (V4LE-23)
+- the same cap applies to the fee-only split: whatever the pool hook credits to the position in its before-remove callback (the auction drip donated to in-range liquidity) lands in the collected amounts after the quote was taken and goes to the owner, never to the liquidator
+- `LeverageTransformer.leverageIn` accepts a native-ETH pool for a wrapped-native-asset vault (the alias the vault, the oracle and leverageUp/Down already use): the borrowed WETH is unwrapped for the pool and all pool-side arithmetic and the optional swap use the native currency
+- `Transformer._validateCaller` accepts only a registered vault inside its transform of that token or the NFT owner; a transformer's own custody of an NFT (e.g. one parked in `V4Utils` by a plain `transferFrom`) is not authority for a public caller. The `V4Utils` safe-transfer callback executes through an internal path bound to the token it just received
+- `V4Utils` forwards a tagged RevertHook remint claim (`abi.encodePacked(REMINT_MIGRATION_TAG, oldTokenId)` in mint / increase hookData) only from `execute` and only when it names the token that call is draining for its authorized caller; `swapAndMint` and `swapAndIncreaseLiquidity` refuse any claim, since the hook trusts the locker (V4Utils) being approved on the old token and would otherwise let anyone claim a drained position's automation
+
+### V4Oracle
+
+File:
+- [`src/oracle/V4Oracle.sol`](/Users/kalinbas/Code/v4lend/src/oracle/V4Oracle.sol)
+
+Purpose:
+- LP valuation
+- fee valuation
+- Chainlink normalization
+- oracle-vs-pool deviation checks
+- L2 sequencer guard integration
+
+Boundary behavior:
+- the feed-derived sqrt price in `_loadPositionState` only splits liquidity into token amounts, which saturates beyond the position's range, so it is clamped to `TickMath.MIN_SQRT_PRICE..MAX_SQRT_PRICE` (exact, no value change). A pool at the price boundary with an honest feed ratio slightly above it therefore stays valuable and liquidatable instead of reverting in a `uint160` cast
+- `getPoolSqrtPriceX96` is consumed numerically (swap floors, oracle ticks) and reverts with `SqrtPriceOutOfRange` for ratios outside the sqrt-price domain rather than overflowing above or returning zero below
+- `getValue` divides each price-times-amount term with `FullMath.mulDiv` (V4LE-64): a valid extreme-tick position (Q96 price ~2^224) no longer overflows a checked product while its quotient fits
+- uncollected fees are bounded at v4's `toInt128` settlement limit (V4LE-6): a fee amount >= 2^127 reverts with `SettlementBoundExceeded` instead of being counted as collateral, since `Pool.modifyLiquidity` settles fees on every collection and decrease and rejects that amount (unreachable for a configured token, whose supply is below it)
+- principal amounts are NOT bounded in the valuation (Scan #2 V4LE-98 / V4LE-156, revising V4LE-61): a snapshot bound there became a liquidation lockout as soon as the price drifted past it. The settlement guard is the token-supply bound at configuration instead (see the liquidation note above)
+- the L2 sequencer uptime / grace guard runs once per external read in `getPoolSqrtPriceX96` and `_loadPositionState` (`_requireSequencerUp`, V4LE-2), so `Mode.TWAP` reads are guarded like Chainlink ones and a Chainlink read no longer consults the uptime feed once per leg
+- an unverified Chainlink read (`Mode.CHAINLINK`, or a two-source mode with `maxDifference == type(uint16).max`) re-reads `feed.decimals()` and reverts with `FeedDecimalsChanged` when it differs from the value cached at `setTokenConfig` (V4LE-15); the owner re-runs `setTokenConfig` to accept a feed precision migration. Verified two-source reads pay nothing: a 10^k mis-scaling always trips the deviation check
+- the same unverified reads re-read `token.decimals()` (and the reference token's, once per read) and revert with `TokenDecimalsChanged` on a mismatch with the cached exponent (V4LE-25); native ETH is fixed at 18. A configured token is re-accepted through `setTokenConfig`; `referenceTokenDecimals` is immutable, so a reference-token unit change needs a new oracle deployment and fails closed until then
+
+### RevertHook
+
+Files:
+- [`src/RevertHook.sol`](/Users/kalinbas/Code/v4lend/src/RevertHook.sol)
+- [`src/hook/`](/Users/kalinbas/Code/v4lend/src/hook)
+
+Purpose:
+- swap-triggered LP automation
+- auto exit
+- auto range
+- auto collect
+- auto lend
+- auto leverage
+
+Important implementation detail:
+- the deployed hook delegates execution into sidecar contracts
+- storage layout compatibility matters across the shared hook/action state spine
+
+External audit 2026-09 fixes (hook):
+- V4LE-4: the `_afterSwap` oracle window is exact - `oracleTick +- maxTicksFromOracle` on unrounded ticks, compared with the exact live tick (`_outsideOracleWindow`); bucket rounding is only used for the cursor walk, so a spacing-200 pool no longer dispatches up to 399 ticks off-oracle
+- V4LE-41: a full removal by AUTO_LEND / AUTO_RANGE / AUTO_EXIT that succeeds but credits nothing in either currency (the carried protocol fee consumed the whole principal inside the remove callback) reverts with `RemovalConsumedByFees` in `_decreaseLiquidity`, the same rule the partial deleverage removal already had; the action fails (`HookActionFailed`) and rolls back instead of leaving an emptied NFT with no shares, remint or exit proceeds
+- V4LE-16: the range an AUTO_RANGE remint produces is fixed by the config (`[B + lowerDelta, B + upperDelta]` from the fired bucket B), so whether the replacement's own range trigger or a relative exit is already satisfied at B is a pure config property; `_validateRangeConfig` refuses such configs (`lowerDelta >= lowerLimit`, `upperDelta + upperLimit <= 0`, relative exit offsets inside the shift) at `setPositionConfig` and on vault remints, instead of arming a trigger behind the traversal cursor after the remint. A trigger the action's own swap carried the price past is strictly beyond the fired bucket and is consumed by the continued walk
+- V4LE-74: `AutoRangeLib.plan` clamps the shifted range to `[minUsableTick, maxUsableTick]` so a trigger fired at a TickMath edge remints into the nearest mintable range instead of failing the planner and consuming the trigger; `autoRange` also refuses a collapsed (invalid) range, and the config-time same-range check evaluates the clamped plan, so an edge position whose clamped replacement is itself is rejected at `setPositionConfig`
+- V4LE-70: reactivating a configured, inactive position through an ordinary (non-hook) liquidity add now evaluates its triggers at the live tick (`_checkTriggerConditions`, auto-leverage re-centred first like a remint) and reverts with `TriggerAlreadySatisfied` when one is satisfied, instead of arming it behind the fresh cursor where no walk would visit it; execution inside the add callback is not possible (PositionManager lock), so the owner reconfigures (immediate execution) or disables automation before adding. The hook's own restore adds are exempt as before
+- V4LE-49: vault-backed actions resolve the vault asset to a pool currency through `_lendCurrency`, which treats WETH as the alias of native ETH like the oracle, the vaults and `NativeAssetLib` do: a WETH-asset vault position in a native pool is accepted by `_validateAutoLeverageMode`, a leverage-up unwraps the borrowed WETH into the pool's native side and every repayment (`_repayDebtToVault`) wraps native proceeds before the vault pulls WETH
+- V4LE-51: the oracle debt-admission API validates the hook automation against the vault asset at borrow and after transforms. The configure-before-deposit bypass is rejected before debt is accepted; zero-debt exits remain supported.
+- V4LE-71: failed leverage actions set `autoLeverageNeedsAttention`. The owner repairs debt/funds or the target and submits `setPositionConfig` for a bounded retry/rearm; success clears the marker. No rounding-up or automatic swap-loop retry is used.
+- V4LE-53 / V4LE-21: both external-route and same-pool plans include the automation output fee. Same-pool plans with nonzero output fees use a bounded balance solve against net tick-walking output and final pool price; zero-fee plans retain the analytic path.
+- V4LE-72: withdrawals cannot create unsecured protocol-fee receivables. Supported paths collect/pay fees using `INCREASE_LIQUIDITY(0)` before removing principal in the same unlock. Direct PositionManager clients must use the fee-paying collection/batch when fees are due.
+
+See also:
+- [`docs/hook-hierarchy.md`](/Users/kalinbas/Code/v4lend/docs/hook-hierarchy.md)
+
+### Standalone Automators
+
+Files:
+- [`src/automators/AutoCollect.sol`](/Users/kalinbas/Code/v4lend/src/automators/AutoCollect.sol)
+- [`src/automators/AutoExit.sol`](/Users/kalinbas/Code/v4lend/src/automators/AutoExit.sol)
+- [`src/automators/AutoLend.sol`](/Users/kalinbas/Code/v4lend/src/automators/AutoLend.sol)
+- [`src/automators/AutoLeverage.sol`](/Users/kalinbas/Code/v4lend/src/automators/AutoLeverage.sol)
+- [`src/automators/AutoRange.sol`](/Users/kalinbas/Code/v4lend/src/automators/AutoRange.sol)
+- shared base: [`src/automators/Automator.sol`](/Users/kalinbas/Code/v4lend/src/automators/Automator.sol)
+
+Purpose:
+- operator-driven execution outside the hook path
+- one strategy per contract
+
+Important implementation detail:
+- protocol fees are sent directly to `protocolFeeRecipient`
+- automators no longer retain protocol fees or use a withdrawer model
+- `AutoLeverage` operators supply swap routing, so every execution must land the debt ratio inside the owner's configured band (`AutoLeverageLib.landsWithinTolerance`): leverage-up may not overshoot `target + rebalanceThresholdBps`, and deleverage may not stop above it. A strict ratio decrease is not enough on deleverage because liquidity removal is sized for the full planned repayment; the band check is what bounds an operator that swaps only part of the removed tokens or routes part of the swap output elsewhere. The hook's own auto-leverage keeps the looser `improvesTowardTarget` rule since its swaps go through protocol-managed routes
+- `maxSwapSlippageBps == 10000` still disables the oracle output floor per swap; in that mode the band check is the only on-chain bound on how far an execution may fall short of the plan
+- `AutoExit` trigger evaluation is inclusive on both sides (lower reached at or below `token0TriggerTick`, upper at or above `token1TriggerTick`), the same convention as the hook's trigger evaluator
+- `AutoExit` vault exits settle the debt before the automation reward: when the proceeds net of the reserved reward do not cover the debt, the reward reserved in the lend token pays the remainder and is reduced by it
+- `AutoLend` deactivation (`configToken` with `isActive == false`) revokes the operator for both legs; `withdraw` rejects a deactivated position and the owner's `forceExit` is the recovery path for an already-lent one
+- `AutoExit` vault exits require the vault asset to be a pool token only when the loan carries debt; a zero-debt loan in any accepted collateral pair exits with the removed tokens sent to the owner
+
+### Controllers
+
+Files:
+- [`src/hook/HookOwnedControllerBase.sol`](/Users/kalinbas/Code/v4lend/src/hook/HookOwnedControllerBase.sol)
+- [`src/hook/HookFeeController.sol`](/Users/kalinbas/Code/v4lend/src/hook/HookFeeController.sol)
+- [`src/hook/HookRouteController.sol`](/Users/kalinbas/Code/v4lend/src/hook/HookRouteController.sol)
+- [`src/hook/HookAuctionController.sol`](/Users/kalinbas/Code/v4lend/src/hook/HookAuctionController.sol)
+- [`src/hook/HookLeaseController.sol`](/Users/kalinbas/Code/v4lend/src/hook/HookLeaseController.sol)
+- [`src/automators/AuctionArbExecutor.sol`](/Users/kalinbas/Code/v4lend/src/automators/AuctionArbExecutor.sol)
+
+Purpose:
+- keep fee governance, swap routing, and the fee-discount market out of `RevertHook` storage
+- `HookFeeController`: LP protocol fee, auto-lend gain fee, per-mode hook swap fee, protocol fee recipient. The recipient is direct-sent, so the system addresses are refused: zero, hook, controller, PoolManager and (external audit V4LE-27) the v4 PositionManager, whose permissionless SWEEP hands its whole balance to any caller - the latter two via tolerant staticcalls to the hook's `poolManager()` / `positionManager()` getters, so the PositionManager rejection is live only once the hook exposes `positionManager()`
+- `HookRouteController`: protocol-managed single-pool routes per ordered token pair
+- `HookAuctionController`: per-epoch English auction selling a discounted-LP-fee executor slot; the winning bid minus a protocol fee is dripped to in-range LPs through `PoolManager.donate` over the following epoch
+- `HookLeaseController`: Harberger-lease alternative with the same hook-facing interface; one lessee self-assesses a price, pays per-second rent on it, can be bought out at that price, and rent minus a protocol fee is dripped to in-range LPs. The prepaid runway is bounded by `MAX_PREPAID_RUNWAY_SECONDS` (365 days) at install, top-up and price cut (external audit V4LE-22): rent rounds up to 1 raw unit/second, so a minimum-price lessee used to reach the uint40 `paidThrough` sentinel for ~1e-6 tokens and become unevictable, blocking wind-down and `configurePool`
+- `AuctionArbExecutor`: owner-operated executor a bidder registers as the discount recipient; the controllers recognise the executor as the address that calls `PoolManager.swap` directly
+- the hook exposes `positionManager()` (public immutable) so `HookFeeController` can refuse the PositionManager, whose permissionless SWEEP would let anyone take fees sent there, as protocol fee recipient
+- `HookAuctionController` pending bucket: value that could not be donated (zero in-range liquidity, failed donates, carried epochs) aggregates in `pendingDonation` and releases gradually. Each release is paced by `pendingReleasePerEpoch`, the largest single epoch's `totalDrip` that fed the bucket, over `epochLengthSeconds`, never by a fraction of the aggregate: a dust LP that appears after several zero-liquidity epochs can capture at most one epoch's slice per `minDripSeconds`, the same exposure as the live epoch drip. A bucket of N epochs therefore takes about N epochs to drain; `sweepPendingDonation` remains the wind-down path. A FAILED active-epoch donate (blacklisting / fee-on-transfer auction currency) parks the vested slice into this bucket too (external audit V4LE-42): it used to stay claimable and pay out in one lump to whoever was in range when the currency recovered
+- `HookLeaseController` pending bucket: same shape. Parked rent releases at `pendingReleasePerHorizon`, one `dripHorizonSeconds` of rent at the lease price the value accrued at (largest among contributions), over the horizon, so a dust LP after a long gap gets at most the rent the lease would have paid over its holding interval
+
+Auth model:
+- all controllers are administered through `hook.owner()`
+- they do not keep an independent mutable owner
+- a deployment wires exactly one of the auction or lease controller as the hook's immutable auction controller
+
+Known design points auditors should read first:
+- the discount applies only when `sender == executor`; hook-internal swaps never receive it
+- drips `sync`/`settle` inside the caller's unlock, which assumes integrators sync immediately before paying
+- controllers hold bidder escrow and prepaid rent; refunds are pull-based
+- lease wind-down is finite (external audit V4LE-36): `setLeasingEnabled(false)` freezes top-ups and runway-extending price cuts, and the prepaid runway is capped at `MAX_PREPAID_RUNWAY_SECONDS`, so a running lease - including one whose registered executor is a permissionless forwarder that hands the discount to every caller - ends within that bound and `evictLease` (permissionless) then frees the slot for `configurePool`
+
+### Hook Protocol Fee Deferral
+
+`PositionManager` attributes hook fees to principal for slippage checks. Fee-paying collections therefore use `INCREASE_LIQUIDITY(0)` with max inputs; supported withdrawals prepend that collection in the same unlock. A removal that cannot settle all protocol fees reverts. `HookFeeController` quotes fresh and carried liabilities; the oracle values collateral net of them and sizes withdrawals to cover fixed principal charges. Historical carried-fee migration checks remain defensive, but new withdrawals cannot create those receivables.
+
+### Remint Migration
+
+When a vault transform replaces the collateral NFT, `V4Vault.transform` calls `migrateVaultPosition(oldTokenId, newTokenId)` on the allowlisted pool hook so trigger state, swap protection, and the carried protocol fee follow the loan. Automation follows only inside the same pool; a move to a pool this hook does not serve retires the old token's automation. Non-vault range changes through `V4Utils` do not migrate (`AUDIT-ACCEPTED-NONVAULT-REMINT-AUTOMATION-LOSS`).
+
+## Accounting Model
+
+This section is intentionally explicit because it is a recurring source of review comments.
+
+### Whole-Balance Sweep Model
+
+The following helper/execution layers intentionally use a whole-balance accounting model:
+- hook action helpers in [`src/hook/RevertHookActionBase.sol`](/Users/kalinbas/Code/v4lend/src/hook/RevertHookActionBase.sol)
+- vault transformer helpers in [`src/vault/transformers/V4Utils.sol`](/Users/kalinbas/Code/v4lend/src/vault/transformers/V4Utils.sol)
+- leverage transformer logic in [`src/vault/transformers/LeverageTransformer.sol`](/Users/kalinbas/Code/v4lend/src/vault/transformers/LeverageTransformer.sol)
+- automators in [`src/automators/`](/Users/kalinbas/Code/v4lend/src/automators)
+
+Intended behavior:
+- these execution helpers are expected to finish a successful call with no unintended leftover underlying balances
+- they may read or sweep whole self-balances during execution
+- any residual balance present at the start of a successful call is treated as part of the next sweep by design
+
+This is intentional and not considered a bug by itself.
+
+### Flat-After-Success Expectation
+
+For successful executions:
+- `RevertHook` helper paths are expected to end flat in the relevant pool tokens / ETH
+- automators are expected to end flat in the relevant pool tokens / ETH
+- transformer helper contracts are expected to end flat in the relevant working assets / ETH
+
+Exception:
+- [`src/automators/AutoLend.sol`](/Users/kalinbas/Code/v4lend/src/automators/AutoLend.sol) intentionally holds ERC4626 vault shares while a position is in its lent state
+- “empty after execution” for `AutoLend` means no stray underlying tokens or ETH remain, not that ERC4626 share balances are always zero
+
+### Components That Intentionally Hold Balances
+
+These contracts are not expected to end flat:
+- [`src/vault/V4Vault.sol`](/Users/kalinbas/Code/v4lend/src/vault/V4Vault.sol)
+- ERC4626 lend vaults used by `AutoLend`
+
+`V4Vault` intentionally holds:
+- lender asset liquidity
+- reserves
+- loan state
+- collateral NFTs
+
+## Fee Model
+
+### Hook Fees
+
+Hook fee governance is in:
+- [`src/hook/HookFeeController.sol`](/Users/kalinbas/Code/v4lend/src/hook/HookFeeController.sol)
+
+Fee types:
+- LP protocol fee
+- auto-lend gain fee
+- hook swap fee
+
+Hook swap-fee behavior:
+- charged only on hook-internal swaps
+- charged on actual output, not input
+- only for swap-bearing modes
+- routed directly to `protocolFeeRecipient`
+- not retained in the hook
+
+### Hook Swap Routing
+
+Hook routing is protocol-managed through:
+- [`src/hook/HookRouteController.sol`](/Users/kalinbas/Code/v4lend/src/hook/HookRouteController.sol)
+
+Current routing model:
+- single-pool route per ordered `(tokenIn, tokenOut)`
+- direction-specific routing
+- fallback to the source pool when no route is configured
+- no retry-on-source if a configured alternate route fails
+
+Important constraint:
+- dynamic-fee routes are intentionally rejected
+- only static-fee routes are supported by the current planning logic
+
+### Automator Fees
+
+Automators:
+- send protocol fees directly to `protocolFeeRecipient`
+- do not retain protocol fees in-contract
+- do not use a withdrawer escrow model anymore
+
+Automators intentionally do not have a separate onchain swap-fee schedule like the hook because their swap paths are composed offchain through quoted calldata.
+
+## Position / Config Model
+
+### Hook
+
+Per-position config still exists for:
+- mode activation
+- trigger configuration
+- swap protection / price impact limits
+
+Routing is no longer per-position.
+
+Per-position route choice was removed in favor of protocol-level routing via `HookRouteController`.
+
+### Vault
+
+Vault operation depends on admin configuration for:
+- token collateral factors and value caps
+- hook allowlist
+- transformer allowlist
+- global and daily debt / lend limits
+- minimum loan size
+
+### Oracle
+
+Oracle coverage is mandatory for:
+- vault valuation / health checks
+- hook oracle guardrails
+- slippage checks when they are not explicitly disabled
+
+## Important Non-Upgradeable / Deployment Notes
+
+The current architecture is effectively redeploy-oriented rather than upgrade-in-place:
+- hook controllers are standalone deployed contracts
+- hook action sidecars store controller references as immutables
+- the deployed hook stores sidecar addresses as immutables
+- the hook address is part of hooked pool identity
+
+Practical consequence:
+- changing the live hook stack typically means a new hook deployment and new hooked pools, not just swapping one helper contract
+
+## Intended Security Invariants
+
+Auditors should expect the protocol to maintain these invariants:
+
+Vault:
+- only authorized borrowers can modify their loan state
+- debt, collateral value, and liquidation conditions stay coherent
+- reserve accounting never creates or destroys lender claims incorrectly
+
+Hook:
+- no unauthorized action execution
+- trigger bookkeeping remains internally consistent
+- one action failure should not corrupt unrelated trigger state
+- delegatecall sidecars must remain storage-layout compatible with the shared state spine
+
+Automators:
+- only approved operators can execute
+- protocol fees are sent directly to the recipient
+- successful executions should not strand unintended underlying balances
+
+Oracle:
+- price normalization and feed selection stay coherent
+- pool/oracle deviation checks gate unsafe valuations
+
+## Tests Most Relevant To Audit
+
+Core suites:
+- [`test/vault/V4Vault.t.sol`](/Users/kalinbas/Code/v4lend/test/vault/V4Vault.t.sol)
+- [`test/hook/RevertHook.t.sol`](/Users/kalinbas/Code/v4lend/test/hook/RevertHook.t.sol)
+- [`test/hook/RevertHookNativeAutoLend.t.sol`](/Users/kalinbas/Code/v4lend/test/hook/RevertHookNativeAutoLend.t.sol)
+- [`test/vault/V4VaultHook.t.sol`](/Users/kalinbas/Code/v4lend/test/vault/V4VaultHook.t.sol)
+- [`test/automators/`](/Users/kalinbas/Code/v4lend/test/automators)
+- [`test/oracle/V4OracleTest.t.sol`](/Users/kalinbas/Code/v4lend/test/oracle/V4OracleTest.t.sol)
+
+Invariant suites:
+- [`test/hook/invariants/`](/Users/kalinbas/Code/v4lend/test/hook/invariants)
+- [`test/vault/invariants/`](/Users/kalinbas/Code/v4lend/test/vault/invariants)
+
+Recent tests of note:
+- automator contracts finishing empty after successful operations
+- protocol fees sent directly to the fee recipient
+- hook route-controller behavior
+- hook sw

@@ -1,0 +1,489 @@
+oracle sources
+    /// @param _maxPoolPriceDifference Maximum allowable price difference expressed in basis points (e.g., 1000 = 10%)
+    function setMaxPoolPriceDifference(uint16 _maxPoolPriceDifference) external onlyOwner {
+        maxPoolPriceDifference = _maxPoolPriceDifference;
+        emit SetMaxPoolPriceDifference(_maxPoolPriceDifference);
+    }
+
+    /// @notice Sets sequencer uptime feed for L2 validation (requires owner privileges)
+    /// @dev Configures Chainlink sequencer uptime monitor for L2 networks like Arbitrum/Optimism
+    /// @param feed Address of Chainlink sequencer uptime feed (use address(0) to disable for L1)
+    function setSequencerUptimeFeed(address feed) external onlyOwner {
+        sequencerUptimeFeed = feed;
+        emit SetSequencerUptimeFeed(feed);
+    }
+
+    /// @notice Gets configured price for a token in reference token terms with caching support
+    /// @dev Internal function that calculates relative price between a token and the reference token
+    /// @param token Token address to get price for (use address(0) for native ETH)
+    /// @param cachedChainlinkReferencePriceX96 Cached price of reference token to avoid redundant Chainlink calls
+    /// @return priceX96 Price of token relative to reference token in Q96 format
+    /// @return chainlinkReferencePriceX96 Chainlink price of reference token used for calculation
+    function _getReferenceTokenPriceX96(address token, uint256 cachedChainlinkReferencePriceX96)
+        internal
+        view
+        returns (uint256 priceX96, uint256 chainlinkReferencePriceX96)
+    {
+        if (token == referenceToken) {
+            return (Q96, cachedChainlinkReferencePriceX96);
+        }
+
+        TokenConfig memory feedConfig = feedConfigs[token];
+        Mode mode = feedConfig.mode;
+
+        if (mode == Mode.NOT_SET) {
+            revert NotConfigured();
+        }
+
+        uint256 verifyPriceX96;
+        // A single-source read (or a two-source read whose deviation check is disabled) has no independent
+        // price that would expose changed feed or token metadata, so the metadata cached at configuration
+        // is re-checked against the live contracts; a verified two-source read fails closed on its own
+        // (a 10^k mis-scaling always exceeds any representable maxDifference) and pays nothing.
+        bool unverified = !_isTwoSourceMode(mode) || feedConfig.maxDifference == type(uint16).max;
+        if (_usesChainlink(mode)) {
+            uint256 chainlinkPriceX96 = _getChainlinkPriceX96(token, unverified);
+            if (cachedChainlinkReferencePriceX96 == 0) {
+                chainlinkReferencePriceX96 = _getChainlinkPriceX96(referenceToken, unverified);
+            } else {
+                chainlinkReferencePriceX96 = cachedChainlinkReferencePriceX96;
+                // The cached denominator comes from the other leg's read. When that was a verified
+                // two-source read it checked only the ratio of its two feeds, not the reference feed's own
+                // scale (a coordinated precision migration of both feeds passes it), so an unverified read
+                // re-checks the reference feed it divides by, cache or not (V4LE-112).
+                if (unverified) {
+                    _requireReferenceFeedDecimals();
+                }
+            }
+            if (unverified) {
+                _requireTokenDecimals(referenceToken, referenceTokenDecimals);
+                _requireTokenDecimals(token, feedConfig.tokenDecimals);
+            }
+            uint256 referencePriceX96 =
+                _normalizeChainlinkPrice(feedConfig, chainlinkPriceX96, chainlinkReferencePriceX96);
+
+            if (mode == Mode.TWAP_CHAINLINK_VERIFY) {
+                verifyPriceX96 = referencePriceX96;
+            } else {
+                priceX96 = referencePriceX96;
+            }
+        }
+
+        if (_usesTWAP(mode)) {
+            // The TWAP leg is read in the alias's raw unit and applied to the token's: an unverified read
+            // re-checks that both still carry the unit bound at configuration (V4LE-147). The token as its
+            // own alias moves with itself and needs no check; in Chainlink-using modes the token was
+            // checked above.
+            if (unverified && feedConfig.twapTokenAlias != token) {
+                if (mode == Mode.TWAP) {
+                    _requireTokenDecimals(token, feedConfig.tokenDecimals);
+                }
+                _requireTokenDecimals(feedConfig.twapTokenAlias, feedConfig.tokenDecimals);
+            }
+            uint256 twapPriceX96 = _getTWAPPriceX96(feedConfig);
+            if (mode == Mode.CHAINLINK_TWAP_VERIFY) {
+                verifyPriceX96 = twapPriceX96;
+            } else {
+                priceX96 = twapPriceX96;
+            }
+        }
+
+        if (_isTwoSourceMode(mode)) {
+            _requireMaxDifference(priceX96, verifyPriceX96, feedConfig.maxDifference);
+        }
+    }
+
+    /// @notice L2 sequencer guard, applied once per external price read (`getPoolSqrtPriceX96` and every
+    ///         position read through `_loadPositionState`) and therefore to every source mode. A TWAP-only
+    ///         read consults the v3 pool's observations, which are just as frozen during a sequencer outage
+    ///         as a Chainlink round, so the guard is not tied to the Chainlink path.
+    /// @dev No-op on chains without a configured uptime feed (L1).
+    function _requireSequencerUp() internal view returns (uint256 restart) {
+        if (sequencerUptimeFeed == address(0)) {
+            return 0;
+        }
+        (
+            uint80 sequencerRoundId,
+            int256 sequencerAnswer,
+            uint256 sequencerStartedAt,
+            uint256 sequencerUpdatedAt,
+            uint80 sequencerAnsweredInRound
+        ) = AggregatorV3Interface(sequencerUptimeFeed).latestRoundData();
+
+        // Answer == 0: Sequencer is up
+        // Answer == 1: Sequencer is down
+        if (sequencerAnswer == 1) {
+            revert SequencerDown();
+        }
+
+        // Feed result must be valid
+        if (
+            sequencerRoundId == 0 || sequencerAnsweredInRound < sequencerRoundId || sequencerStartedAt == 0
+                || sequencerUpdatedAt < sequencerStartedAt || sequencerUpdatedAt > block.timestamp || sequencerAnswer != 0
+        ) {
+            revert SequencerUptimeFeedInvalid();
+        }
+
+        // Make sure grace period has passed since sequencer is back up
+        uint256 timeSinceUp = block.timestamp - sequencerStartedAt;
+        if (timeSinceUp <= SEQUENCER_GRACE_PERIOD_TIME) {
+            revert SequencerGracePeriodNotOver();
+        }
+        return sequencerStartedAt;
+    }
+
+    /// @notice Calculates Chainlink-compatible price with validation for given token address
+    /// @dev Internal function that fetches feed price with stale check validation; the sequencer guard runs
+    ///      once per read in the callers, see `_requireSequencerUp`.
+    /// @param token Token address to get price for (use address(0) for native ETH)
+    /// @param checkDecimals Re-read the feed's `decimals()` and reject a value that differs from the one
+    ///        cached at configuration (an upgraded feed proxy would otherwise be scaled with the old exponent)
+    /// @return uint256 Chainlink price normalized to Q96 format (decimal adjustment included)
+    function _getChainlinkPriceX96(address token, bool checkDecimals) internal view returns (uint256) {
+        if (token == chainlinkReferenceToken) {
+            return Q96;
+        }
+
+        TokenConfig memory feedConfig = feedConfigs[token];
+
+        // Check if token is configured
+        if (address(feedConfig.feed) == address(0)) {
+            revert NotConfigured();
+        }
+
+        if (checkDecimals && feedConfig.feed.decimals() != feedConfig.feedDecimals) {
+            revert FeedDecimalsChanged();
+        }
+
+        // Get latest round data from Chainlink
+        (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound) =
+            feedConfig.feed.latestRoundData();
+
+        // Check for stale data or invalid price
+        if (
+            roundId == 0 || answeredInRound < roundId || startedAt == 0 || updatedAt == 0 || updatedAt > block.timestamp
+                || block.timestamp - updatedAt > feedConfig.maxFeedAge || answer <= 0
+        ) {
+            revert ChainlinkPriceError();
+        }
+
+        return FullMath.mulDiv(SafeCast.toUint256(answer), Q96, 10 ** feedConfig.feedDecimals);
+    }
+
+    /// @dev Reference-feed counterpart of the `checkDecimals` re-read in `_getChainlinkPriceX96`, for a read
+    ///      that reuses a cached reference price instead of reading the feed.
+    function _requireReferenceFeedDecimals() internal view {
+        if (referenceToken == chainlinkReferenceToken) {
+            return;
+        }
+        TokenConfig storage referenceConfig = feedConfigs[referenceToken];
+        if (referenceConfig.feed.decimals() != referenceConfig.feedDecimals) {
+            revert FeedDecimalsChanged();
+        }
+    }
+
+    /// @dev Rejects a token whose live `decimals()` differs from the exponent cached for it (an upgraded
+    ///      token would otherwise have its Chainlink price converted into the wrong raw unit). Native ETH
+    ///      has fixed 18 decimals. For a configured token the owner re-runs `setTokenConfig`; the
+    ///      reference token's decimals are immutable, so a change there needs a new oracle deployment.
+    function _requireTokenDecimals(address token, uint8 cachedDecimals) internal view {
+        if (token != address(0) && IERC20Metadata(token).decimals() != cachedDecimals) {
+            revert TokenDecimalsChanged();
+        }
+    }
+
+    function _normalizeChainlinkPrice(
+        TokenConfig memory feedConfig,
+        uint256 chainlinkPriceX96,
+        uint256 chainlinkReferencePriceX96
+    ) internal view returns (uint256 priceX96) {
+        if (referenceTokenDecimals > feedConfig.tokenDecimals) {
+            priceX96 = FullMath.mulDiv(
+                (10 ** (referenceTokenDecimals - feedConfig.tokenDecimals)) * chainlinkPriceX96,
+                Q96,
+                chainlinkReferencePriceX96
+            );
+        } else if (referenceTokenDecimals < feedConfig.tokenDecimals) {
+            // 512-bit product: a valid in-domain ratio (a 6-decimal reference against an 18-decimal token
+            // at a raw price of 2^64 has a feed price of ~2^200 in Q96) overflowed the checked
+            // `chainlinkPriceX96 * Q96` although the quotient fits (V4LE-135). Dividing by the reference
+            // price first and by the decimal scale second yields the same floor as one division.
+            priceX96 = FullMath.mulDiv(chainlinkPriceX96, Q96, chainlinkReferencePriceX96)
+                / (10 ** (feedConfig.tokenDecimals - referenceTokenDecimals));
+        } else {
+            priceX96 = FullMath.mulDiv(chainlinkPriceX96, Q96, chainlinkReferencePriceX96);
+        }
+    }
+
+    function _getTWAPPriceX96(TokenConfig memory feedConfig) internal view returns (uint256 poolTWAPPriceX96) {
+        if (feedConfig.twapTokenAlias == referenceToken) {
+            return Q96;
+        }
+        if (address(feedConfig.twapPool) == address(0)) {
+            revert NotConfigured();
+        }
+
+        uint256 priceX96 = _getReferencePoolPriceX96(feedConfig.twapPool, feedConfig.twapSeconds);
+        if (feedConfig.twapTokenIsToken0) {
+            poolTWAPPriceX96 = priceX96;
+        } else {
+            poolTWAPPriceX96 = FullMath.mulDiv(Q96, Q96, priceX96);
+        }
+    }
+
+    function _getReferencePoolPriceX96(IUniswapV3Pool pool, uint32 twapSeconds) internal view returns (uint256) {
+        if (twapSeconds == 0) {
+            (uint160 sqrtPriceX96,,,,,,) = pool.slot0();
+            return _priceX96FromSqrtPriceX96(sqrtPriceX96);
+        }
+
+        uint32[] memory secondsAgos = new uint32[](2);
+        secondsAgos[0] = 0;
+        secondsAgos[1] = twapSeconds;
+        (int56[] memory tickCumulatives,) = pool.observe(secondsAgos);
+
+        int56 tickCumulativeDelta = tickCumulatives[0] - tickCumulatives[1];
+        int56 twapPeriod = int56(uint56(twapSeconds));
+        int24 tick = int24(tickCumulativeDelta / twapPeriod);
+        if (tickCumulativeDelta < 0 && tickCumulativeDelta % twapPeriod != 0) {
+            tick--;
+        }
+
+        return _priceX96FromSqrtPriceX96(TickMath.getSqrtPriceAtTick(tick));
+    }
+
+    function _validateTWAPPool(IUniswapV3Pool pool, address twapToken) internal view returns (bool twapTokenIsToken0) {
+        if (twapToken == referenceToken) {
+            return false;
+        }
+        if (address(pool) == address(0)) {
+            revert InvalidPool();
+        }
+
+        address poolToken0 = pool.token0();
+        address poolToken1 = pool.token1();
+        if (!((poolToken0 == twapToken && poolToken1 == referenceToken)
+                    || (poolToken0 == referenceToken && poolToken1 == twapToken))) {
+            revert InvalidPool();
+        }
+        twapTokenIsToken0 = poolToken0 == twapToken;
+    }
+
+    function _isValidMode(Mode mode) internal pure returns (bool) {
+        return mode == Mode.CHAINLINK_TWAP_VERIFY || mode == Mode.TWAP_CHAINLINK_VERIFY || mode == Mode.CHAINLINK
+            || mode == Mode.TWAP;
+    }
+
+    function _usesChainlink(Mode mode) internal pure returns (bool) {
+        return mode == Mode.CHAINLINK_TWAP_VERIFY || mode == Mode.TWAP_CHAINLINK_VERIFY || mode == Mode.CHAINLINK;
+    }
+
+    function _usesTWAP(Mode mode) internal pure returns (bool) {
+        return mode == Mode.CHAINLINK_TWAP_VERIFY || mode == Mode.TWAP_CHAINLINK_VERIFY || mode == Mode.TWAP;
+    }
+
+    function _isTwoSourceMode(Mode mode) internal pure returns (bool) {
+        return mode == Mode.CHAINLINK_TWAP_VERIFY || mode == Mode.TWAP_CHAINLINK_VERIFY;
+    }
+
+    /// @notice Validates that price difference between two sources doesn't exceed maximum threshold
+    /// @dev Internal function that enforces price deviation limits for oracle validation
+    /// @param priceX96 First price in Q96 format for comparison
+    /// @param verifyPriceX96 Second price in Q96 format for comparison
+    /// @param maxDifferenceX10000 Maximum allowable difference expressed in basis points (e.g., 1000 = 10%)
+    function _requireMaxDifference(uint256 priceX96, uint256 verifyPriceX96, uint16 maxDifferenceX10000) internal pure {
+        if (maxDifferenceX10000 == type(uint16).max) {
+            return;
+        }
+        if (verifyPriceX96 == 0) {
+            revert PriceDifferenceExceeded();
+        }
+
+        uint256 difference = priceX96 >= verifyPriceX96 ? priceX96 - verifyPriceX96 : verifyPriceX96 - priceX96;
+
+        if (FullMath.mulDiv(difference, 10000, verifyPriceX96) > maxDifferenceX10000) {
+            revert PriceDifferenceExceeded();
+        }
+    }
+
+    struct PositionState {
+        uint256 tokenId;
+        PoolId poolId;
+        PoolKey poolKey;
+        Currency currency0;
+        Currency currency1;
+        uint24 fee;
+        int24 tickLower;
+        int24 tickUpper;
+        uint128 liquidity;
+        uint256 feeGrowthInside0LastX128;
+        uint256 feeGrowthInside1LastX128;
+        uint160 sqrtPriceX96;
+        int24 tick;
+        uint160 sqrtPriceX96Lower;
+        uint160 sqrtPriceX96Upper;
+        uint256 price0X96;
+        uint256 price1X96;
+        uint160 derivedSqrtPriceX96;
+        uint256 cachedChainlinkReferencePriceX96;
+    }
+
+    /// @notice Loads complete position state and price data from V4 position manager using tokenId
+    /// @dev Internal function that consolidates all position data including liquidity, ticks, currencies, and price calculations
+    /// @param tokenId Token ID of the position NFT to load state for
+    /// @return state Complete PositionState struct containing all position data and calculated prices
+    function _loadPositionState(uint256 tokenId) internal view returns (PositionState memory state) {
+        _requireSequencerUp();
+        state.tokenId = tokenId;
+
+        // Get position info from PositionManager
+        (PoolKey memory poolKey, PositionInfo positionInfo) = positionManager.getPoolAndPositionInfo(tokenId);
+
+        state.poolId = PoolIdLibrary.toId(poolKey);
+        state.poolKey = poolKey;
+
+        // Extract position data
+        state.tickLower = PositionInfoLibrary.tickLower(positionInfo);
+        state.tickUpper = PositionInfoLibrary.tickUpper(positionInfo);
+
+        state.poolId = PoolIdLibrary.toId(poolKey);
+        state.currency0 = poolKey.currency0;
+        state.currency1 = poolKey.currency1;
+        state.fee = poolKey.fee;
+
+        // Get basic pool slot0 data (price, tick)
+        (state.sqrtPriceX96, state.tick,,) = StateLibrary.getSlot0(poolManager, state.poolId);
+
+        // Get price data from chainlink feeds
+        (state.price0X96, state.cachedChainlinkReferencePriceX96) =
+            _getReferenceTokenPriceX96(Currency.unwrap(state.currency0), state.cachedChainlinkReferencePriceX96);
+        (state.price1X96,) =
+            _getReferenceTokenPriceX96(Currency.unwrap(state.currency1), state.cachedChainlinkReferencePriceX96);
+
+        // Check derived pool price for manipulation attacks
+        uint256 derivedPoolPriceX96 = FullMath.mulDiv(state.price0X96, Q96, state.price1X96);
+
+        // Current pool price
+        uint256 priceX96 = _priceX96FromSqrtPriceX96(state.sqrtPriceX96);
+        _requireMaxDifference(priceX96, derivedPoolPriceX96, maxPoolPriceDifference);
+
+        // Derived sqrt price, used only to split the position's liquidity into token amounts.
+        // That split saturates outside the position's tick range, and no range extends past the
+        // TickMath bounds, so clamping the derived price to those bounds yields exactly the
+        // amounts of the unclamped value. A live pool sitting at the price boundary with an
+        // honest feed ratio a fraction of a percent higher still passes the deviation check but
+        // overflows uint160 (MAX_SQRT_PRICE is within 0.01% of it); an unchecked cast would then
+        // revert here and block valuation, health checks and liquidation of the position.
+        uint256 derivedSqrtPriceX96 = _sqrtPriceX96FromPriceX96(derivedPoolPriceX96);
+        if (derivedSqrtPriceX96 > TickMath.MAX_SQRT_PRICE) {
+            derivedSqrtPriceX96 = TickMath.MAX_SQRT_PRICE;
+        } else if (derivedSqrtPriceX96 < TickMath.MIN_SQRT_PRICE) {
+            derivedSqrtPriceX96 = TickMath.MIN_SQRT_PRICE;
+        }
+        // forge-lint: disable-next-line(unsafe-typecast)
+        state.derivedSqrtPriceX96 = uint160(derivedSqrtPriceX96);
+
+        // Get position liquidity and previous fee growth data
+        (state.liquidity, state.feeGrowthInside0LastX128, state.feeGrowthInside1LastX128) = StateLibrary.getPositionInfo(
+            poolManager, state.poolId, address(positionManager), state.tickLower, state.tickUpper, bytes32(tokenId)
+        );
+    }
+
+    function _priceX96FromSqrtPriceX96(uint160 sqrtPriceX96) internal pure returns (uint256) {
+        return FullMath.mulDiv(uint256(sqrtPriceX96), uint256(sqrtPriceX96), Q96);
+    }
+
+    /// @dev Inverse of _priceX96FromSqrtPriceX96 (sqrt(p * 2^96) * 2^48 = sqrt(p) * 2^96). Returns
+    ///      uint256: the result exceeds uint160 for price ratios above ~2^128, which callers decide
+    ///      how to treat.
+    function _sqrtPriceX96FromPriceX96(uint256 priceX96) internal pure returns (uint256) {
+        return Math.sqrt(priceX96) * (2 ** 48);
+    }
+
+    /// @notice Calculates token amounts of a position based on oracle-derived price
+    /// @dev Internal function that converts liquidity to token amounts using oracle price instead of pool price.
+    ///      Not bounded at the v4 settlement limit: a configured token's supply is below it
+    ///      (`_requireBoundedSupply`), so no principal amount of an accepted position can reach it, and a bound
+    ///      in the valuation itself became a liquidation lockout as soon as the price drifted past it
+    ///      (V4LE-61, V4LE-98, V4LE-156).
+    /// @param state Complete PositionState struct containing position data and derived price
+    /// @return amount0 Calculated amount of token0 based on oracle-derived sqrt price
+    /// @return amount1 Calculated amount of token1 based on oracle-derived sqrt price
+    function _getAmounts(PositionState memory state) internal pure returns (uint256 amount0, uint256 amount1) {
+        if (state.liquidity > 0) {
+            // Calculate sqrt prices for tick range using derived price from oracle
+            state.sqrtPriceX96Lower = TickMath.getSqrtPriceAtTick(state.tickLower);
+            state.sqrtPriceX96Upper = TickMath.getSqrtPriceAtTick(state.tickUpper);
+
+            // Use LiquidityAmounts library to calculate amounts from liquidity
+            // Similar to V4Utils._calculateLiquidity but in reverse (amounts from liquidity)
+            (amount0, amount1) = LiquidityAmounts.getAmountsForLiquidity(
+                state.derivedSqrtPriceX96, // Current price (from oracle)
+                state.sqrtPriceX96Lower, // Lower tick price
+                state.sqrtPriceX96Upper, // Upper tick price
+                state.liquidity // Position liquidity
+            );
+        }
+    }
+
+    /// @notice Calculates uncollected fees for a V4 position using FullMath precision
+    /// @dev Internal function that computes accrued trading fees following Uniswap V4 fee calculation methodology
+    /// @param state PositionState
+    function _getFees(PositionState memory state) internal view returns (uint128 fees0, uint128 fees1) {
+        if (state.liquidity == 0) {
+            return (0, 0);
+        }
+
+        // Get current fee growth inside the position range
+        (uint256 feeGrowthInside0X128, uint256 feeGrowthInside1X128) =
+            StateLibrary.getFeeGrowthInside(poolManager, state.poolId, state.tickLower, state.tickUpper);
+
+        // Calculate uncollected fees following Uniswap V4 guide
+        fees0 = _calculateUncollectedFees(feeGrowthInside0X128, state.feeGrowthInside0LastX128, state.liquidity);
+
+        fees1 = _calculateUncollectedFees(feeGrowthInside1X128, state.feeGrowthInside1LastX128, state.liquidity);
+    }
+
+    /// @notice Helper function to calculate uncollected fees using FullMath precision math
+    /// @dev Internal function that implements the core fee calculation formula: liquidity * (feeGrowth - feeGrowthLast) / Q128
+    /// @dev The subtraction MUST be unchecked, mirroring Uniswap v4 `Position.update`. `feeGrowthInside` is a
+    ///      modular (mod 2^256) accumulator: `Pool.getFeeGrowthInside` derives it from `feeGrowthGlobal` minus the
+    ///      `feeGrowthOutside` snapshots of both ticks, each written with `unchecked` arithmetic, so both the live
+    ///      value and the position's `feeGrowthInsideLast` snapshot can wrap and be numerically smaller than the
+    ///      other while the true accrued growth (their difference mod 2^256) stays small and positive. A common
+    ///      trigger is a position whose upper tick was initialized before its lower tick while the price sat
+    ///      above both. With checked arithmetic that wrapped state panics, which would block `getValue` and every
+    ///      vault health check and liquidation of the position. The final narrowing is bounded like Uniswap's:
+    ///      `Pool.modifyLiquidity` narrows the same product with `toInt128()`, so a fee amount >= 2^127 reverts
+    ///      every collection and liquidity decrease of the position (fees are settled on each of them). Such an
+    ///      amount is reported with `SettlementBoundExceeded` instead of being counted as collateral; a plain
+    ///      uint128 cast accepted [2^127, 2^128) although v4 can never pay it out.
+    /// @param feeGrowthInsideX128 Current fee growth accumulator inside the position range (Q128 format)
+    /// @param feeGrowthInsideLastX128 Last fee growth accumulator when fees were collected (Q128 format)
+    /// @param liquidity Current liquidity amount in the position
+    /// @return uint128 Calculated uncollected fees for this token type
+    function _calculateUncollectedFees(uint256 feeGrowthInsideX128, uint256 feeGrowthInsideLastX128, uint128 liquidity)
+        internal
+        pure
+        returns (uint128)
+    {
+        if (liquidity == 0) {
+            return 0;
+        }
+
+        uint256 deltaFeeGrowth;
+        unchecked {
+            deltaFeeGrowth = feeGrowthInsideX128 - feeGrowthInsideLastX128;
+        }
+        if (deltaFeeGrowth == 0) {
+            return 0;
+        }
+
+        uint256 fees = FullMath.mulDiv(deltaFeeGrowth, liquidity, FixedPoint128.Q128);
+        if (fees >= V4_SETTLEMENT_BOUND) {
+            revert SettlementBoundExceeded();
+        }
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return uint128(fees);
+    }
+}
